@@ -1,0 +1,320 @@
+import asyncio
+import copy
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+import aiohttp
+from aiohttp import web
+import zstandard
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / 'scripts'))
+from bot_common import ConfigError, DEFAULTS, StopBot, Trader, WSOL, credentials, load_config, run_stream
+from copytrader_bot import Copytrader
+from live_sniper_bot import Sniper
+from backtest_sniper_strategy import Backtest, replay_file
+from sell_all_tokens import select_balances, sell_selected
+
+MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
+WALLET = '11111111111111111111111111111111'
+OTHER = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'
+
+
+def event(action='create', **extra):
+    return {'action': action, 'mint': MINT, 'quoteMint': WSOL, 'pool': 'pump',
+            'mayhemMode': False, 'price': 1.0, 'quoteAmount': 21, 'tokenAmount': 21,
+            'txSigner': WALLET, 'timestamp': 1000, 'poolFeeRate': 0.0125,
+            'signature': 'launch', **extra}
+
+
+class ConfigTests(unittest.TestCase):
+    def test_example_config_valid_and_secret_free(self):
+        cfg = load_config(ROOT / 'config.example.toml')
+        self.assertEqual(cfg['trade']['quote_mint'], WSOL)
+        self.assertNotIn('private_key', cfg['wallet'])
+
+    def test_invalid_slippage_type_and_typo_fail(self):
+        for text in ('[trade]\nbuy_slippage=100', '[trade]\nbuy_amount="small"', '[trade]\nbuy_amont=1'):
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.toml') as file:
+                file.write(text)
+                file.flush()
+                with self.assertRaises(ConfigError):
+                    load_config(file.name)
+
+    def test_credentials_are_optional_until_live_and_api_key_wins(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(ConfigError):
+                credentials()
+        with patch.dict(os.environ, {'ZEROSLIP_API_KEY': 'test-key', 'ZEROSLIP_PRIVATE_KEY': 'test-private'}, clear=True):
+            self.assertEqual(credentials(), {'apiKey': 'test-key'})
+
+    def test_all_cli_checks_and_missing_config(self):
+        scripts = [('live_sniper_bot.py', []), ('copytrader_bot.py', ['--wallet', WALLET]),
+                   ('backtest_sniper_strategy.py', []), ('sell_all_tokens.py', ['--mint', MINT])]
+        for filename, options in scripts:
+            env = {k: v for k, v in os.environ.items() if not k.startswith('ZEROSLIP_')}
+            env['ZEROSLIP_WALLET_PUBLIC_KEY'] = OTHER
+            result = subprocess.run([sys.executable, str(ROOT/'scripts'/filename), '--config',
+                                     str(ROOT/'config.example.toml'), '--check-config', *options],
+                                    capture_output=True, text=True, env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('No network calls', result.stdout)
+        result = subprocess.run([sys.executable, str(ROOT/'scripts/live_sniper_bot.py'), '--config',
+                                 '/nonexistent/config.toml', '--check-config'], capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('copy config.example.toml', result.stderr)
+
+
+class StrategyTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.cfg = copy.deepcopy(DEFAULTS)
+        self.cfg['copytrader']['wallets'] = [WALLET, OTHER]
+        # An object with no HTTP methods proves paper mode cannot send a request.
+        self.trader = Trader(self.cfg, object())
+
+    async def test_copy_buy_and_two_proportional_sells(self):
+        strategy = Copytrader(self.cfg, self.trader)
+        await strategy.on_event(event('buy', tokenAmount=100, quoteAmount=10))
+        self.assertAlmostEqual(strategy.positions[MINT]['tokens'], .01)
+        await strategy.on_event(event('sell', tokenAmount=50, txSigner=OTHER))
+        self.assertAlmostEqual(strategy.positions[MINT]['tokens'], .01)
+        await strategy.on_event(event('sell', tokenAmount=50))
+        self.assertAlmostEqual(strategy.positions[MINT]['tokens'], .005)
+        await strategy.on_event(event('sell', tokenAmount=50))
+        self.assertNotIn(MINT, strategy.positions)
+
+    async def test_followed_additional_buy_updates_exit_baseline(self):
+        strategy = Copytrader(self.cfg, self.trader)
+        await strategy.on_event(event('buy', tokenAmount=100))
+        await strategy.on_event(event('buy', tokenAmount=100))
+        await strategy.on_event(event('sell', tokenAmount=100))
+        self.assertAlmostEqual(strategy.positions[MINT]['tokens'], .005)
+
+    async def test_sell_failure_keeps_copy_position(self):
+        strategy = Copytrader(self.cfg, self.trader)
+        await strategy.on_event(event('buy', tokenAmount=100))
+        async def failure(*args, **kwargs):
+            raise StopBot('uncertain')
+        self.trader.order = failure
+        with self.assertRaises(StopBot):
+            await strategy.on_event(event('sell', tokenAmount=100))
+        self.assertEqual(strategy.positions[MINT]['copied_remaining'], 100)
+
+    async def test_copy_filters_and_first_buy(self):
+        strategy = Copytrader(self.cfg, self.trader)
+        await strategy.on_event(event('buy', mayhemMode=True))
+        self.assertFalse(strategy.positions)
+        self.cfg['copytrader']['first_buy_only'] = True
+        await strategy.on_event(event('buy', postBalances={WALLET: {MINT: 1000}}))
+        self.assertFalse(strategy.positions)
+        await strategy.on_event(event('buy', postBalances={WALLET: {MINT: 21}}))
+        self.assertIn(MINT, strategy.positions)
+
+    async def test_sniper_take_profit_and_buy_once(self):
+        self.cfg['sniper']['token_mint'] = MINT
+        strategy = Sniper(self.cfg, self.trader)
+        await strategy.on_event(event('buy', pool='orca-whirlpool'))
+        self.assertIn(MINT, strategy.positions)
+        await strategy.on_event(event('sell', pool='orca-whirlpool', price=1.6))
+        self.assertFalse(strategy.positions)
+        await strategy.on_event(event('buy', pool='orca-whirlpool'))
+        self.assertFalse(strategy.positions)
+
+    async def test_sniper_stop_loss_and_idle(self):
+        for exit_type in ('sl', 'idle'):
+            now = [0]
+            strategy = Sniper(self.cfg, self.trader, clock=lambda: now[0])
+            await strategy.on_event(event())
+            if exit_type == 'sl':
+                await strategy.on_event(event('sell', price=.7))
+            else:
+                now[0] = 301
+                await strategy.on_tick()
+            self.assertFalse(strategy.positions)
+
+    async def test_sniper_filters_malformed_events(self):
+        strategy = Sniper(self.cfg, self.trader)
+        for value in ({}, event(mayhemMode=True), event(price=0), event(quoteAmount=1)):
+            await strategy.on_event(value)
+        self.assertFalse(strategy.positions)
+
+    def test_backtest_latency_slippage_and_window_end(self):
+        strategy = Backtest(self.cfg)
+        strategy.handle_event(event())
+        strategy.handle_event(event('buy', timestamp=1500, price=1.3))
+        self.assertEqual(strategy.missed, 1)
+        self.assertFalse(strategy.positions)
+        strategy = Backtest(self.cfg)
+        strategy.handle_event(event())
+        strategy.finish()
+        self.assertFalse(strategy.trades) # No synthetic buy after replay ended.
+        strategy = Backtest(self.cfg)
+        strategy.handle_event(event())
+        strategy.handle_event(event('buy', timestamp=1500, price=1.1))
+        self.assertAlmostEqual(strategy.positions[MINT]['entry'], 1.1)
+        strategy.handle_event(event('sell', timestamp=2000, price=1.7))
+        strategy.handle_event(event('sell', timestamp=2500, price=1.8))
+        self.assertEqual(len(strategy.trades), 1)
+        self.assertGreater(strategy.trades[0]['pnl'], 0)
+
+    def test_local_plain_and_compressed_replay(self):
+        raw = b'\n'.join(json.dumps(e).encode() for e in [event(), event('buy', timestamp=1500), event('sell', timestamp=2000, price=2)]) + b'\nnot-json\n'
+        with tempfile.TemporaryDirectory() as folder:
+            for extension, data in [('jsonl', raw), ('jsonl.zst', zstandard.ZstdCompressor().compress(raw))]:
+                file = Path(folder)/('events.'+extension)
+                file.write_bytes(data)
+                strategy = Backtest(self.cfg)
+                replay_file(file, strategy)
+                strategy.finish()
+                self.assertEqual(len(strategy.trades), 1)
+                self.assertEqual(strategy.skipped, 1)
+
+    def test_sell_selection_preserves_quote_and_wsol(self):
+        holdings = {MINT: {'balance': 10}, WSOL: {'balance': 20}, OTHER: {'balance': 0}}
+        self.assertEqual(list(select_balances(self.cfg, holdings, True)), [MINT])
+        self.cfg['sell']['token_mints'] = [MINT]
+        self.assertEqual(list(select_balances(self.cfg, holdings, False)), [MINT])
+
+
+class StreamIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_copy_fill_received_while_strategy_waits(self):
+        cfg = copy.deepcopy(DEFAULTS)
+        cfg['copytrader']['wallets'] = [WALLET]
+        cfg['trade']['confirmation_seconds'] = 1
+        sockets, orders = [], []
+        completed = asyncio.Event()
+
+        async def stream(request):
+            socket = web.WebSocketResponse()
+            await socket.prepare(request)
+            sockets.append(socket)
+            await socket.send_json(event('buy', tokenAmount=100))
+            async for _ in socket:
+                pass
+            return socket
+
+        async def api(request):
+            body = await request.json()
+            orders.append(body)
+            await sockets[0].send_json(event('buy', signature='own-fill', txSigner=OTHER,
+                                             tokenAmount=.01, quoteAmount=.01))
+            return web.json_response({'signature': 'own-fill'})
+
+        app = web.Application()
+        app.router.add_get('/stream', stream)
+        app.router.add_post('/', api)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, '127.0.0.1', 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        cfg['network']['trade_url'] = f'http://127.0.0.1:{port}/'
+        cfg['network']['stream_url'] = f'ws://127.0.0.1:{port}/stream'
+        try:
+            with patch.dict(os.environ, {'ZEROSLIP_API_KEY': 'mock-key'}, clear=True):
+                async with aiohttp.ClientSession() as session:
+                    trader = Trader(cfg, session, live=True)
+                    strategy = Copytrader(cfg, trader)
+                    async def on_tick():
+                        if MINT in strategy.positions:
+                            completed.set()
+                    task = asyncio.create_task(run_stream(cfg, trader, strategy.on_event, on_tick))
+                    try:
+                        await asyncio.wait_for(completed.wait(), timeout=3)
+                        self.assertEqual(len(orders), 1)
+                        self.assertEqual(strategy.positions[MINT]['tokens'], .01)
+                    finally:
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+        finally:
+            await runner.cleanup()
+
+
+class ApiTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.cfg = copy.deepcopy(DEFAULTS)
+        self.cfg['trade']['confirmation_seconds'] = .1
+        self.payloads = []
+        self.app = web.Application()
+        self.app.router.add_post('/', self.handler)
+        self.runner = web.AppRunner(self.app)
+        await self.runner.setup()
+        self.site = web.TCPSite(self.runner, '127.0.0.1', 0)
+        await self.site.start()
+        port = self.site._server.sockets[0].getsockname()[1]
+        self.cfg['network']['trade_url'] = f'http://127.0.0.1:{port}/'
+        self.cfg['network']['rpc_url'] = self.cfg['network']['trade_url']
+        self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=2))
+        self.trader = Trader(self.cfg, self.session, live=True)
+        self.response = None
+        self.confirm = True
+        self.env = patch.dict(os.environ, {'ZEROSLIP_API_KEY': 'mock-api-key'}, clear=True)
+        self.env.start()
+
+    async def asyncTearDown(self):
+        self.env.stop()
+        await self.session.close()
+        await self.runner.cleanup()
+
+    async def handler(self, request):
+        body = await request.json()
+        self.payloads.append(body)
+        if self.response is not None:
+            return web.json_response(self.response)
+        if body.get('action') == 'getBalances':
+            return web.json_response({'tokenBalances': {MINT: {'balance': 10}}})
+        if body.get('method') == 'getTokenAccountsByOwner':
+            return web.json_response({'result': {'value': []}})
+        if self.confirm:
+            self.trader.observe(event(body['action'], signature='mock-signature', tokenAmount=1))
+        return web.json_response({'signature': 'mock-signature', 'err': ''})
+
+    async def test_live_request_and_early_stream_confirmation(self):
+        data = await self.trader.order('buy', MINT, WSOL, .01, 1)
+        self.assertEqual(data['tokenAmount'], 1)
+        body = self.payloads[0]
+        self.assertEqual(body['apiKey'], 'mock-api-key')
+        self.assertNotIn('privateKey', body)
+        self.assertEqual(body['denominatedInQuote'], 'true')
+        self.assertNotIn('guaranteedDelivery', body)
+
+    async def test_timeout_never_retries(self):
+        self.confirm = False
+        with self.assertRaises(StopBot):
+            await self.trader.order('buy', MINT, WSOL, .01, 1)
+        self.assertEqual(len(self.payloads), 1)
+
+    async def test_rejected_and_missing_signature_stop(self):
+        for response in ({'err': 'rejected'}, {}):
+            self.response = response
+            with self.assertRaises(StopBot):
+                await self.trader.order('sell', MINT, WSOL, '100%', 1)
+
+    async def test_sell_success_and_unconfirmed_failure(self):
+        self.cfg['sell']['token_mints'] = [MINT]
+        with patch('sell_all_tokens.api_post') as post:
+            post.side_effect = [ {'tokenBalances': {MINT: {'balance': 10}}},
+                                 {'signature': 'sell-signature', 'confirmed': True, 'trades': [{'quoteMint': WSOL}]} ]
+            await sell_selected(self.cfg, self.session, True, False)
+            self.assertEqual(post.call_args_list[1].args[2]['guaranteedDelivery'], 'true')
+            self.assertEqual(post.call_args_list[1].args[2]['amount'], '100%')
+            post.side_effect = [ {'tokenBalances': {MINT: {'balance': 10}}}, {'confirmed': False} ]
+            with self.assertRaises(StopBot):
+                await sell_selected(self.cfg, self.session, True, False)
+
+    async def test_preview_only_makes_read_only_rpc_calls(self):
+        self.cfg['wallet']['public_key'] = WALLET
+        self.cfg['sell']['token_mints'] = [MINT]
+        await sell_selected(self.cfg, self.session, False, False)
+        self.assertEqual(len(self.payloads), 2)
+        self.assertTrue(all(p.get('method') == 'getTokenAccountsByOwner' and 'apiKey' not in p for p in self.payloads))
+
+
+if __name__ == '__main__':
+    unittest.main()
