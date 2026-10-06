@@ -17,20 +17,21 @@ import websockets
 
 ROOT = Path(__file__).resolve().parent.parent
 WSOL = 'So11111111111111111111111111111111111111112'
+USDC = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
+SOL_USDC_POOL = 'Gf7sXMoP8iRw4iiXmJ1nq4vxcRycbGXy5RL8a8LnTd3v'
 DEFAULTS = {
     'network': {'trade_url': 'https://api.zeroslip.ai', 'stream_url': 'wss://stream.zeroslip.ai/',
                 'replay_url': 'https://replay.pumpapi.io', 'rpc_url': 'https://api.mainnet-beta.solana.com'},
     'trade': {'quote_mint': WSOL, 'buy_amount': 0.001, 'buy_slippage': 20.0,
-              'sell_slippage': 20.0, 'priority_fee': 0.0001, 'confirmation_seconds': 15.0,
-              'max_positions': 3},
+              'sell_slippage': 99.0, 'priority_fee': 0.0001, 'confirmation_seconds': 3.0},
     'wallet': {'public_key': ''},
     'copytrader': {'wallets': [], 'token_mints': [], 'buy_fraction': 0.1,
-                   'max_buy_amount': 0.01, 'first_buy_only': False},
+                   'max_buy_amount': 0.01},
     'sniper': {'token_mint': '', 'min_initial_buy': 20.0, 'take_profit': 50.0,
                'stop_loss': 20.0, 'idle_seconds': 300.0},
-    'backtest': {'hours': 1, 'allow_gaps': False, 'buy_latency_ms': 400,
+    'backtest': {'hours': 10, 'allow_gaps': False, 'buy_latency_ms': 400,
                  'sell_latency_ms': 400, 'service_fee': 0.0025, 'extra_fee': 0.0005},
-    'sell': {'token_mints': []},
+    'sell': {'token_mints': [], 'slippage': 100.0},
 }
 
 
@@ -86,12 +87,14 @@ def load_config(path):
                          ('sniper', 'take_profit'), ('sniper', 'stop_loss')]:
         if cfg[section][key] <= 0:
             raise ConfigError(f'{section}.{key} must be positive')
-    for section, key in [('trade', 'max_positions'), ('backtest', 'hours')]:
+    for section, key in [('backtest', 'hours')]:
         if not isinstance(cfg[section][key], int) or cfg[section][key] < 1:
             raise ConfigError(f'{section}.{key} must be a positive integer')
     for key in ('buy_slippage', 'sell_slippage'):
         if not 0 <= cfg['trade'][key] < 100:
             raise ConfigError(f'trade.{key} must be between 0 and 100 (exclusive)')
+    if not 0 <= cfg['sell']['slippage'] <= 100:
+        raise ConfigError('sell.slippage must be between 0 and 100 (inclusive)')
     if not 0 < cfg['copytrader']['buy_fraction'] <= 1:
         raise ConfigError('copytrader.buy_fraction must be between 0 and 1')
     if not 0 < cfg['sniper']['stop_loss'] < 100:
@@ -193,6 +196,27 @@ def positive(value):
         return 0.0
 
 
+class QuoteSizing:
+    """Original two-quote strategy: SOL sizes, converted to USDC at stream price."""
+    def __init__(self):
+        self.sol_price = 80.0  # Original fallback until the trusted pool updates.
+
+    def observe(self, event):
+        if event.get('poolId') != SOL_USDC_POOL:
+            return False
+        price = positive(event.get('price'))
+        if price:
+            self.sol_price = 1 / price
+        return True
+
+    def amount(self, quote, sol_amount):
+        return sol_amount if quote == WSOL else sol_amount * self.sol_price
+
+    @staticmethod
+    def supports(quote):
+        return quote in (WSOL, USDC)
+
+
 async def api_post(session, url, payload):
     # Never log the credential-bearing payload or a server body that may echo it.
     try:
@@ -210,7 +234,7 @@ async def api_post(session, url, payload):
 class Trader:
     def __init__(self, cfg, session, live=False):
         self.cfg, self.session, self.live = cfg, session, live
-        self.events = TTLCache(maxsize=10000, ttl=60)
+        self.events = TTLCache(maxsize=10000, ttl=300)
 
     def observe(self, event):
         signature = event.get('signature')
@@ -238,15 +262,36 @@ class Trader:
                 if event.get('action') == action and event.get('mint') == mint and positive(event.get('price')) and positive(event.get('tokenAmount')):
                     logging.info('Confirmed %s mint=%s signature=%s', action, mint, signature)
                     return event
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.1)
         raise StopBot(f'No trade event observed for {signature}. Check the wallet before restarting; no order was retried')
 
 
-async def run_stream(cfg, trader, on_event, on_tick):
-    queue = asyncio.Queue(maxsize=10000)
-    # Exact duplicate events may reappear after reconnecting. Include event fields
-    # so multiple swaps with the same signature are not collapsed into one.
+async def run_stream(cfg, trader, on_event, on_tick, accept_event=None):
+    # Independent token workers restore the original cross-token concurrency.
+    # A token's exits stay in stream order so proportional bookkeeping is stable.
+    queues = {}
+    workers = set()
+    failure = asyncio.get_running_loop().create_future()
     seen = TTLCache(maxsize=50000, ttl=300)
+
+    def completed(task):
+        workers.discard(task)
+        if not task.cancelled() and task.exception() is not None and not failure.done():
+            failure.set_exception(task.exception())
+
+    async def token_worker(mint, queue):
+        while True:
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=1)
+                await on_event(event)
+            except asyncio.TimeoutError:
+                pass
+            tracking = await on_tick(mint)
+            if not tracking and queue.empty():
+                # No await between checking/removing: reader cannot enqueue into
+                # an orphaned queue. Untracked tokens don't retain idle workers.
+                queues.pop(mint, None)
+                return
 
     async def reader():
         while True:
@@ -261,36 +306,40 @@ async def run_stream(cfg, trader, on_event, on_tick):
                         if not isinstance(event, dict):
                             continue
                         trader.observe(event)
+                        mint = event.get('mint') or '__market__'
+                        # Once a token worker exists, retain its market updates
+                        # even while its buy hasn't registered a position yet.
+                        if accept_event is not None and not accept_event(event) and mint not in queues:
+                            continue
                         identity = json.dumps(event, sort_keys=True)
                         if identity in seen:
                             continue
                         seen[identity] = True
+                        if mint not in queues:
+                            queues[mint] = asyncio.Queue(maxsize=10000)
+                            task = asyncio.create_task(token_worker(mint, queues[mint]))
+                            workers.add(task)
+                            task.add_done_callback(completed)
                         try:
-                            queue.put_nowait(event)
+                            queues[mint].put_nowait(event)
                         except asyncio.QueueFull as exc:
-                            raise StopBot('Market event queue overflowed; stop and reconcile wallet positions') from exc
+                            raise StopBot('Token event queue overflowed; reconcile wallet positions') from exc
             except (OSError, websockets.exceptions.WebSocketException):
-                logging.warning('Stream disconnected; reconnecting in 2 seconds')
-                await asyncio.sleep(2)
+                logging.warning('Stream disconnected; reconnecting in 0.4 seconds')
+                await asyncio.sleep(0.4)
 
-    async def worker():
-        while True:
-            try:
-                event = await asyncio.wait_for(queue.get(), timeout=1)
-                await on_event(event)
-            except asyncio.TimeoutError:
-                pass
-            await on_tick()
-
-    tasks = [asyncio.create_task(reader()), asyncio.create_task(worker())]
+    stream = asyncio.create_task(reader())
     try:
-        done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        done, _ = await asyncio.wait([stream, failure], return_when=asyncio.FIRST_COMPLETED)
         for task in done:
             task.result()
     finally:
-        for task in tasks:
+        stream.cancel()
+        for task in workers:
             task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(stream, *workers, return_exceptions=True)
+        if not failure.done():
+            failure.cancel()
 
 
 def run(main):

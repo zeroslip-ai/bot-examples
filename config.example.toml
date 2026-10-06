@@ -3,17 +3,16 @@
 public_key = "" # Your wallet address; required for sell previews; live sells use the credential wallet.
 
 [trade]
-quote_mint = "So11111111111111111111111111111111111111112" # Wrapped SOL; amounts are in SOL.
-buy_amount = 0.001
+quote_mint = "So11111111111111111111111111111111111111112" # Quote balance preserved by sell-all; streaming bots support SOL + USDC.
+buy_amount = 0.001 # SOL-equivalent; USDC amounts convert using the trusted SOL/USDC stream pool.
 buy_slippage = 20
-sell_slippage = 20
+sell_slippage = 99 # Original streaming sell tolerance
 priority_fee = 0.0001 # SOL network priority fee
-max_positions = 3
-confirmation_seconds = 15
+confirmation_seconds = 3
 
 [sniper]
 token_mint = "" # Set a mint to buy once on its next trade; blank scans new Pump launches.
-min_initial_buy = 20 # Quote-token units; applies only to launch mode.
+min_initial_buy = 20 # SOL-equivalent; applies only to launch mode.
 take_profit = 50 # Percent price rise from entry
 stop_loss = 20 # Percent price fall from entry
 idle_seconds = 300
@@ -22,11 +21,10 @@ idle_seconds = 300
 wallets = [] # Add wallet addresses to copy, or pass --wallet ADDRESS.
 token_mints = [] # Empty allows any token within the Pump pool filters.
 buy_fraction = 0.1
-max_buy_amount = 0.01 # Quote-token units (SOL by default)
-first_buy_only = false
+max_buy_amount = 0.01 # SOL-equivalent cap; converts to USDC automatically
 
 [backtest]
-hours = 1 # Completed UTC hours; archives can be hundreds of MB each.
+hours = 10 # Original completed-UTC-hour default; archives can be hundreds of MB each.
 allow_gaps = false
 buy_latency_ms = 400
 sell_latency_ms = 400
@@ -34,6 +32,7 @@ service_fee = 0.0025 # Fraction per side, not percent
 extra_fee = 0.0005 # Additional modeling assumption per side
 
 [sell]
+slippage = 100 # Original sell-all tolerance
 token_mints = [] # Or pass --mint ADDRESS; use --all to select all non-quote balances.
 
 [network]

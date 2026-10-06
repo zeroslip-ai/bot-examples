@@ -30,7 +30,7 @@ Set `trade.buy_amount` in `config.toml` (default **0.001 SOL**), then replace `T
 python scripts/live_sniper_bot.py --mint TOKEN_MINT
 ```
 
-This starts in **paper mode**: at the next trade for that mint against the configured quote token, it simulates one buy, then manages the configured take-profit, stop-loss, and idle exit. It does not send API requests or trades. The selected-token mode can watch any supported venue; the quote mint defaults to wrapped SOL. It buys that mint once per process, rather than re-entering after an exit.
+This starts in **paper mode**: at the next trade for that mint against SOL or USDC, it simulates one buy, then manages the configured take-profit, stop-loss, and idle exit. It does not send API requests or trades. The selected-token mode can watch any supported venue with SOL or USDC quotes. It buys that mint once per process, rather than re-entering after an exit.
 
 You can put the mint in `sniper.token_mint` instead of passing `--mint`. `sniper.take_profit`, `stop_loss`, and `idle_seconds` control exits.
 
@@ -40,7 +40,7 @@ For new Pump.fun launch sniping, leave `sniper.token_mint` empty and omit `--min
 python scripts/live_sniper_bot.py
 ```
 
-Launch mode buys when the initial purchase exceeds `sniper.min_initial_buy` (default 20 SOL). It excludes Mayhem mode and follows Pump.fun / Pump-created PumpSwap pools. `trade.max_positions` caps simultaneously tracked positions. These filters describe strategy scope, not a guarantee about a token's legitimacy.
+Launch mode buys when the initial purchase exceeds `sniper.min_initial_buy` (default 20 SOL-equivalent). It excludes Mayhem mode and follows Pump.fun / Pump-created PumpSwap pools. Both SOL and USDC are supported, with no position cap. These filters describe strategy scope, not a guarantee about a token's legitimacy.
 
 ## Copy a wallet
 
@@ -54,17 +54,17 @@ Or set `copytrader.wallets = ["ADDRESS_1", "ADDRESS_2"]` in `config.toml` and om
 
 The bot copies `copytrader.buy_fraction` of a watched buy, up to `max_buy_amount` (defaults: 10%, capped at 0.01 SOL). It mirrors proportional exits from the same followed wallet, including partial sells. Additional buys by that wallet adjust the tracked exit baseline without buying more in your wallet. The first followed wallet to open a position owns that position's exit signals; another watched wallet cannot close it.
 
-Optional `copytrader.token_mints` limits trading to specific mints. `first_buy_only = true` requires a matching post-trade balance showing that the followed wallet's purchase opened a new position. Copy mode uses the same Pump pool filters as launch sniping and only the configured quote mint.
+Optional `copytrader.token_mints` limits trading to specific mints. The original first-buy gate is always applied: token balances summed across all wallets in the transaction must match the purchased amount within the upstream tolerance. Copy mode uses the same Pump pool filters as launch sniping and supports both SOL and USDC.
 
 ## Backtest launch sniping
 
 No credentials are needed:
 
 ```sh
-python scripts/backtest_sniper_strategy.py --hours 1
+python scripts/backtest_sniper_strategy.py --hours 10
 ```
 
-Downloads the last completed UTC hour into a temporary file, then streams its events. Archives can be hundreds of MB per hour. Missing hours fail the run unless `backtest.allow_gaps = true`.
+Downloads the last ten completed UTC hours by default, one temporary file at a time, then streams their events. Use `--hours 1` for a shorter run. Archives can be hundreds of MB per hour. Missing hours fail the run unless `backtest.allow_gaps = true`.
 
 You can also replay an existing JSONL or Zstandard-compressed archive without network access:
 
@@ -72,9 +72,15 @@ You can also replay an existing JSONL or Zstandard-compressed archive without ne
 python scripts/backtest_sniper_strategy.py --file /path/to/events.jsonl.zst
 ```
 
-The simulator uses the same launch threshold, quote mint, sizing, pool filters, position cap, TP/SL, and idle settings. A configured `sniper.token_mint` restricts which launch is considered; **the backtester models launch entries, not the direct-token entry mode**. Latency, entry slippage, and per-side fee assumptions live in `[backtest]`. Results are printed in the configured quote token's units.
+The simulator restores the original launch threshold, SOL/USDC sizing, pool filters, uncapped positions, TP/SL, idle rules, and fee accounting. **It models all qualifying launch entries, not the direct-token entry mode; `sniper.token_mint` does not filter replay.** Latency, entry slippage, and per-side fee assumptions live in `[backtest]`. Results include separate WSOL/USDC totals and combined SOL-equivalent PnL.
 
-Fills use observed prices around the simulated latency deadline. Sparse events, market depth, network fees, and atomic Jito bundle execution are not fully modeled. Open positions at the end are marked to their last observed price; pending buys that cannot fill inside the window are excluded. Paper and replay results are estimates, not execution guarantees.
+The original replay model resolves pending fills before applying the incoming event's price, using the last known price. It processes out-of-order timestamps as recorded and force-fills pending buys at the end, then closes remaining positions at their last price. These restored assumptions can be optimistic for sparse events or an incomplete replay window. Market depth, network fees, and atomic Jito bundle execution are not fully modeled. Paper and replay results are estimates, not execution guarantees.
+
+## Original behavior and the exit calculation
+
+The standalone setup retains the original first-buy gate, SOL/USDC support, uncapped positions, sell tolerances, three-second stream confirmation window, and replay calculation. SOL sizing and launch thresholds are converted to USDC using the original trusted stream pool, starting at the upstream fallback of $80/SOL until a price update arrives. Fund both quote assets if you intend to trade both.
+
+Copy exits deliberately use the unrounded fraction `tokens sold by followed wallet / its tracked remaining tokens`, applied to your remaining position. With no additional buys, this is mathematically equivalent to an exact cumulative calculation. The original rounds the cumulative percentage and incremental order percentage up to whole numbers; a 1.1% exit becomes 2%, and repeated exits can accumulate over-selling. The proportional calculation tracks the wallet more accurately and incorporates additional followed buys without increasing your own position. This mirrors its exit fraction, not its absolute token holdings. Bookkeeping changes only after a confirmed sell; exits for one mint are serialized so overlapping orders cannot corrupt that calculation.
 
 ## Preview or sell wallet tokens
 
@@ -114,15 +120,15 @@ Settings to review before live use:
 
 | Setting | Meaning |
 | --- | --- |
-| `trade.quote_mint` | Quote asset for buys; SOL by default. Thresholds and amounts use this token's units, with no automatic SOL/USDC conversion. |
-| `trade.buy_amount` | Amount for sniper entries. |
-| `copytrader.max_buy_amount` | Maximum amount for each copied entry. |
-| `trade.buy_slippage`, `sell_slippage` | Percentage tolerance; defaults are 20, rather than unrestricted sell slippage. |
+| `trade.quote_mint` | Quote balance preserved by sell-all; streaming and replay strategies support both SOL and USDC. |
+| `trade.buy_amount` | SOL-equivalent amount for sniper entries; converted to USDC automatically. |
+| `copytrader.max_buy_amount` | Maximum SOL-equivalent amount for each copied entry. |
+| `trade.buy_slippage`, `sell_slippage` | Original streaming tolerances: 20% buy, 99% sell. |
+| `sell.slippage` | Original sell-all tolerance: 100%. |
 | `trade.priority_fee` | Network priority fee in SOL. |
-| `trade.max_positions` | Maximum simultaneously tracked positions in each bot process. |
-| `trade.confirmation_seconds` | Time to wait for the streaming bots' own execution event. |
+| `trade.confirmation_seconds` | Original three-second wait for the streaming bots' own execution event. |
 
-Streaming bots keep reading events while waiting for their own trade signature. An API rejection, timeout, missing signature, or missing confirmation **stops the bot without retrying the order**: an order may have executed even when its response was lost. Check your wallet before restarting. Stream disconnections reconnect with a delay; market events missed during the gap cannot be recovered automatically.
+Streaming bots execute independently across tokens while continuing to read events. Events and exits for the same token are handled in order. An API rejection, timeout, missing signature, or missing confirmation **stops the bot without retrying the order**: an order may have executed even when its response was lost. Check your wallet before restarting. Stream disconnections reconnect with a delay; market events missed during the gap cannot be recovered automatically.
 
 Position tracking lives in memory. Stopping with Ctrl+C **does not liquidate** live holdings, and restarting does not restore earlier positions. Run one strategy per trading wallet, avoid concurrent manual trades in the same tracked token, and use the sell script to handle positions left after a shutdown. Paper fills use observed prices without depth or fee modeling; use the backtester for the configured fee/latency model.
 

@@ -10,112 +10,118 @@ import aiohttp
 import orjson
 import zstandard
 
-from bot_common import positive, run, setup, trusted_pool, StopBot
+from bot_common import QuoteSizing, WSOL, USDC, run, setup, StopBot
 
 
 class Backtest:
+    """Upstream replay ordering, fills, fees and SOL-equivalent accounting."""
     def __init__(self, cfg):
         self.cfg = cfg
+        self.quotes = QuoteSizing()
         self.positions = {}
         self.trades = []
-        self.seen_mints = set()
         self.last_ts = 0
-        self.seen = self.skipped = self.missed = 0
+        self.seen = self.skipped = self.missed = self.buys = self.creates = 0
 
-    def fill_buy(self, mint, position):
-        price = position['price']
-        ceiling = position['decision_price'] / (1 - self.cfg['trade']['buy_slippage'] / 100)
-        if price > ceiling:
-            self.positions.pop(mint)
+    def fill_buy(self, mint, pos):
+        decision, fill = pos['decision_price'], pos['cur_price']
+        ceiling = decision / (1 - min(self.cfg['trade']['buy_slippage'], 99.9) / 100)
+        if fill > ceiling:
             self.missed += 1
+            self.positions.pop(mint, None)
             return
-        amount = self.cfg['trade']['buy_amount']
-        fees = self.cfg['backtest']['service_fee'] + self.cfg['backtest']['extra_fee'] + position['pool_fee']
-        position.update(state='held', entry=price, amount=amount, tokens=amount * (1 - fees) / price,
-                        last=position['due'])
+        amount, quote = pos['amount'], pos['quote_mint']
+        pos.update(state='held', entry_price=fill, quote_spent=amount,
+                   tokens=amount * (1 - self.cfg['backtest']['service_fee'] - self.cfg['backtest']['extra_fee'] - pos['entry_pool_fee']) / fill,
+                   sol_price=self.quotes.sol_price,
+                   spent_sol=amount if quote == WSOL else amount / self.quotes.sol_price,
+                   buy_slip=(fill / decision - 1) * 100, last_ts=pos['buy_fill_ts'])
+        self.buys += 1
 
-    def close(self, mint, position, reason):
-        fees = self.cfg['backtest']['service_fee'] + self.cfg['backtest']['extra_fee'] + position['pool_fee']
-        proceeds = position['tokens'] * position['price'] * (1 - fees)
-        self.trades.append({'mint': mint, 'reason': reason, 'pnl': proceeds - position['amount']})
-        self.positions.pop(mint)
+    def trigger_sell(self, pos, ts, reason):
+        pos.update(state='pending_sell', sell_reason=reason,
+                   sell_fill_ts=ts + self.cfg['backtest']['sell_latency_ms'])
 
-    def trigger_sell(self, position, ts, reason):
-        position.update(state='pending_sell', due=ts + self.cfg['backtest']['sell_latency_ms'], reason=reason)
+    def close(self, mint, pos, exit_price, reason):
+        gross = pos['tokens'] * exit_price
+        fee = self.cfg['backtest']['service_fee'] + self.cfg['backtest']['extra_fee']
+        proceeds = gross * (1 - (fee + pos['last_pool_fee']))
+        pnl = proceeds - pos['quote_spent']
+        fee_quote = pos['quote_spent'] * (fee + pos['entry_pool_fee']) + gross * (fee + pos['last_pool_fee'])
+        is_sol = pos['quote_mint'] == WSOL
+        self.trades.append({'mint': mint, 'quote_mint': pos['quote_mint'], 'reason': reason,
+                            'pct': (exit_price - pos['entry_price']) / pos['entry_price'] * 100,
+                            'pnl': pnl, 'pnl_sol': pnl if is_sol else pnl / pos['sol_price'],
+                            'spent_sol': pos['spent_sol'],
+                            'fee_sol': fee_quote if is_sol else fee_quote / pos['sol_price'],
+                            'buy_slip': pos['buy_slip']})
+        self.positions.pop(mint, None)
 
     def resolve(self, ts):
-        for mint, position in list(self.positions.items()):
-            if position['state'] == 'pending_buy' and ts >= position['due']:
-                self.fill_buy(mint, position)
-            elif position['state'] == 'pending_sell' and ts >= position['due']:
-                self.close(mint, position, position['reason'])
-            elif position['state'] == 'held' and ts - position['last'] >= self.cfg['sniper']['idle_seconds'] * 1000:
-                self.trigger_sell(position, position['last'] + self.cfg['sniper']['idle_seconds'] * 1000, 'idle')
+        for mint, pos in list(self.positions.items()):
+            if pos['state'] == 'pending_buy' and pos['buy_fill_ts'] <= ts:
+                self.fill_buy(mint, pos)
+            elif pos['state'] == 'pending_sell' and pos['sell_fill_ts'] <= ts:
+                self.close(mint, pos, pos['cur_price'], pos['sell_reason'])
+            elif pos['state'] == 'held' and ts - pos['last_ts'] > self.cfg['sniper']['idle_seconds'] * 1000:
+                self.trigger_sell(pos, pos['last_ts'] + self.cfg['sniper']['idle_seconds'] * 1000, 'idle')
 
     def handle_event(self, event):
         self.seen += 1
-        ts = positive(event.get('timestamp'))
-        if not ts or ts < self.last_ts:
-            self.skipped += 1
-            return
+        ts = event['timestamp']
         self.last_ts = ts
-        mint = event.get('mint')
-        price = positive(event.get('price'))
-        relevant = event.get('quoteMint') == self.cfg['trade']['quote_mint'] and trusted_pool(event)
-        # At the first event at/after the latency deadline, use that observed
-        # price, not the launch decision price. Sparse feeds remain an estimate.
-        if mint in self.positions and relevant and price:
-            self.positions[mint].update(price=price, pool_fee=self.pool_fee(event))
+        # Preserve upstream ordering: resolve BEFORE applying this event's price,
+        # including timestamps that arrive out of order in the archive.
         self.resolve(ts)
-        if not relevant or not mint or not price:
+        if event['action'] not in ('buy', 'sell', 'add', 'remove', 'create', 'migrate', 'createPool'):
             return
-        if event.get('action') == 'create' and event.get('pool') == 'pump':
-            selected = self.cfg['sniper']['token_mint']
-            if selected and mint != selected:
-                return
-            if mint in self.seen_mints:
-                return
-            self.seen_mints.add(mint)
-            if positive(event.get('quoteAmount')) <= self.cfg['sniper']['min_initial_buy'] or len(self.positions) >= self.cfg['trade']['max_positions']:
-                return
-            self.positions[mint] = {'state': 'pending_buy', 'decision_price': price, 'price': price,
-                                    'pool_fee': self.pool_fee(event),
-                                    'due': ts + self.cfg['backtest']['buy_latency_ms']}
-        elif mint in self.positions and event.get('action') in ('buy', 'sell', 'add', 'remove', 'migrate'):
-            position = self.positions[mint]
-            if position['state'] == 'held':
-                change = (price / position['entry'] - 1) * 100
-                if change >= self.cfg['sniper']['take_profit'] or change <= -self.cfg['sniper']['stop_loss']:
-                    self.trigger_sell(position, ts, 'tp' if change >= self.cfg['sniper']['take_profit'] else 'sl')
-                else:
-                    position['last'] = ts
-
-    def pool_fee(self, event):
-        value = event.get('poolFeeRate', 0)
-        try:
-            value = float(value)
-            if not 0 <= value < 1 - self.cfg['backtest']['service_fee'] - self.cfg['backtest']['extra_fee']:
-                raise ValueError
-            return value
-        except (ValueError, TypeError):
-            raise StopBot('Replay has an invalid poolFeeRate; cannot model execution costs')
+        mint = event['mint']
+        if self.quotes.observe(event):
+            return
+        if event['action'] == 'create' and event['pool'] == 'pump' and not event.get('mayhemMode'):
+            self.creates += 1
+            quote = event['quoteMint']
+            threshold = self.quotes.amount(quote, self.cfg['sniper']['min_initial_buy'])
+            if self.quotes.supports(quote) and event['quoteAmount'] > threshold and mint not in self.positions:
+                pool_fee = event['poolFeeRate']
+                self.positions[mint] = {'state': 'pending_buy', 'quote_mint': quote,
+                                        'amount': self.quotes.amount(quote, self.cfg['trade']['buy_amount']),
+                                        'decision_price': event['price'], 'cur_price': event['price'],
+                                        'entry_pool_fee': pool_fee, 'last_pool_fee': pool_fee,
+                                        'buy_fill_ts': ts + self.cfg['backtest']['buy_latency_ms'], 'buy_slip': 0.0}
+        elif mint in self.positions:
+            pos = self.positions[mint]
+            if event['action'] in ('buy', 'sell', 'add', 'remove', 'migrate') and (
+                event['pool'] == 'pump' or (event['pool'] == 'pump-amm' and event.get('poolCreatedBy') == 'pump')):
+                price = event['price']
+                pos.update(cur_price=price, last_pool_fee=event['poolFeeRate'])
+                if pos['state'] == 'held':
+                    change = (price - pos['entry_price']) / pos['entry_price'] * 100
+                    if change > self.cfg['sniper']['take_profit'] or change < -self.cfg['sniper']['stop_loss']:
+                        self.trigger_sell(pos, ts, 'tp' if change > self.cfg['sniper']['take_profit'] else 'sl')
+            if pos['state'] == 'held':
+                pos['last_ts'] = ts
 
     def finish(self):
-        pending = 0
-        for mint, position in list(self.positions.items()):
-            if position['state'] == 'pending_buy':
-                # A buy due after the window cannot be counted as a fill.
-                pending += 1
-                self.positions.pop(mint)
-            else:
-                self.close(mint, position, 'end-of-window mark-to-market')
-        logging.info('Events=%s skipped=%s closed=%s missed=%s unfilled-at-end=%s',
-                     self.seen, self.skipped, len(self.trades), self.missed, pending)
-        pnl = sum(trade['pnl'] for trade in self.trades)
-        wins = sum(trade['pnl'] > 0 for trade in self.trades)
-        logging.info('Modeled PnL=%+.8f quote units; wins=%s/%s; quote=%s',
-                     pnl, wins, len(self.trades), self.cfg['trade']['quote_mint'])
-        logging.info('Model includes configured latency, entry slippage and per-side fees; it omits network fees, depth and atomic bundle execution.')
+        # Upstream forces in-flight buys to fill, then closes at last-known price.
+        for mint, pos in list(self.positions.items()):
+            if pos['state'] == 'pending_buy':
+                self.fill_buy(mint, pos)
+        for mint, pos in list(self.positions.items()):
+            reason = pos['sell_reason'] if pos['state'] == 'pending_sell' else (
+                'idle' if self.last_ts - pos['last_ts'] > self.cfg['sniper']['idle_seconds'] * 1000 else 'end')
+            self.close(mint, pos, pos['cur_price'], reason)
+        pnl_sol = sum(trade['pnl_sol'] for trade in self.trades)
+        volume = sum(trade['spent_sol'] for trade in self.trades)
+        wins = sum(trade['pnl_sol'] > 0 for trade in self.trades)
+        logging.info('Events=%s creates=%s buys=%s skipped=%s closed=%s missed=%s',
+                     self.seen, self.creates, self.buys, self.skipped, len(self.trades), self.missed)
+        logging.info('Modeled PnL=%+.8f SOL-equivalent; WSOL=%+.8f; USDC=%+.8f; wins=%s/%s',
+                     pnl_sol, sum(t['pnl'] for t in self.trades if t['quote_mint'] == WSOL),
+                     sum(t['pnl'] for t in self.trades if t['quote_mint'] == USDC), wins, len(self.trades))
+        logging.info('Volume=%s SOL-equivalent; ROI=%+.2f%%; fees=%s SOL-equivalent',
+                     volume, pnl_sol / volume * 100 if volume else 0, sum(t['fee_sol'] for t in self.trades))
+        logging.info('Original replay model: last-known-price fills, end-window forced fills; not live execution guarantees.')
 
 
 def replay_file(path, strategy, compressed=None):
@@ -142,7 +148,10 @@ def read_lines(reader, strategy):
         if not isinstance(event, dict):
             strategy.skipped += 1
             continue
-        strategy.handle_event(event)
+        try:
+            strategy.handle_event(event)
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+            strategy.skipped += 1
 
 
 async def download_hour(session, cfg, hour, destination):

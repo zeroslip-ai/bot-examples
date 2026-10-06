@@ -1,33 +1,34 @@
 """Copy configured wallets with capped buys and proportional exits."""
 import logging
-import math
 
 import aiohttp
 
-from bot_common import Trader, positive, run, run_stream, setup, trusted_pool
+from bot_common import QuoteSizing, Trader, positive, run, run_stream, setup, trusted_pool
 
 
 class Copytrader:
     def __init__(self, cfg, trader):
         self.cfg, self.trader = cfg, trader
         self.positions = {}
+        self.quotes = QuoteSizing()
 
     def watched_wallet(self, event):
         watched = self.cfg['copytrader']['wallets']
         signer = event.get('txSigner')
         if signer in watched:
             return signer
-        # txSigner may be a bundle payer; tradersInvolved identifies traders.
+        # Original wallet matching also covers another trader in postBalances.
         involved = event.get('tradersInvolved') or {}
-        return next((wallet for wallet in watched if wallet in involved), None)
+        balances = event.get('postBalances') or {}
+        return next((wallet for wallet in watched if wallet in involved or wallet in balances), None)
 
     async def on_event(self, event):
-        if event.get('action') not in ('buy', 'sell') or not trusted_pool(event):
+        if not self.accept_event(event):
             return
         wallet = self.watched_wallet(event)
         mint, quote = event.get('mint'), event.get('quoteMint')
         price, quantity = positive(event.get('price')), positive(event.get('tokenAmount'))
-        if not wallet or not mint or not price or not quantity or quote != self.cfg['trade']['quote_mint']:
+        if not wallet or not mint or not price or not quantity or not self.quotes.supports(quote):
             return
         allowed = self.cfg['copytrader']['token_mints']
         if allowed and mint not in allowed:
@@ -37,14 +38,14 @@ class Copytrader:
                 if wallet == self.positions[mint]['wallet']:
                     self.positions[mint]['copied_remaining'] += quantity
                 return
-            if len(self.positions) >= self.cfg['trade']['max_positions']:
-                return
             balances = (event.get('postBalances') or {}).get(wallet, {})
             balance = positive(balances.get(mint))
-            if self.cfg['copytrader']['first_buy_only'] and (not balance or not math.isclose(balance, quantity, rel_tol=1e-6, abs_tol=1e-6)):
+            # Preserve upstream's first-buy gate across ALL transaction wallets.
+            post_total = sum(positive(values.get(mint)) for values in (event.get('postBalances') or {}).values())
+            if abs(post_total - quantity) > max(0.000001, quantity * 0.000001):
                 return
             amount = min(positive(event.get('quoteAmount')) * self.cfg['copytrader']['buy_fraction'],
-                         self.cfg['copytrader']['max_buy_amount'])
+                         self.quotes.amount(quote, self.cfg['copytrader']['max_buy_amount']))
             if amount <= 0:
                 return
             result = await self.trader.order('buy', mint, quote, amount, price)
@@ -64,8 +65,13 @@ class Copytrader:
                 self.positions.pop(mint)
             logging.info('Copied wallet exit %s mint=%s fraction=%.2f%%', wallet, mint, percent)
 
-    async def on_tick(self):
-        pass
+    def accept_event(self, event):
+        if self.quotes.observe(event):
+            return False
+        return event.get('action') in ('buy', 'sell') and trusted_pool(event) and bool(self.watched_wallet(event))
+
+    async def on_tick(self, mint=None):
+        return mint in self.positions
 
 
 async def main():
@@ -73,7 +79,7 @@ async def main():
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
         trader = Trader(cfg, session, args.live)
         strategy = Copytrader(cfg, trader)
-        await run_stream(cfg, trader, strategy.on_event, strategy.on_tick)
+        await run_stream(cfg, trader, strategy.on_event, strategy.on_tick, strategy.accept_event)
 
 
 if __name__ == '__main__':

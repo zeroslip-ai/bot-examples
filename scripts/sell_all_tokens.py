@@ -62,7 +62,7 @@ async def sell_selected(cfg, session, live, all_tokens):
             continue
         data = await api_post(session, cfg['network']['trade_url'], {
             **credentials(), 'action': 'sell', 'mint': mint, 'amount': '100%',
-            'denominatedInQuote': 'false', 'slippage': cfg['trade']['sell_slippage'],
+            'denominatedInQuote': 'false', 'slippage': cfg['sell']['slippage'],
             'priorityFee': cfg['trade']['priority_fee'], 'guaranteedDelivery': 'true',
         })
         if data.get('confirmed') is not True or not data.get('signature'):

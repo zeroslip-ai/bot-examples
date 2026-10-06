@@ -15,7 +15,7 @@ import zstandard
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'scripts'))
-from bot_common import ConfigError, DEFAULTS, StopBot, Trader, WSOL, credentials, load_config, run_stream
+from bot_common import ConfigError, DEFAULTS, StopBot, Trader, WSOL, USDC, SOL_USDC_POOL, credentials, load_config, run_stream
 from copytrader_bot import Copytrader
 from live_sniper_bot import Sniper
 from backtest_sniper_strategy import Backtest, replay_file
@@ -27,13 +27,24 @@ OTHER = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'
 
 
 def event(action='create', **extra):
-    return {'action': action, 'mint': MINT, 'quoteMint': WSOL, 'pool': 'pump',
-            'mayhemMode': False, 'price': 1.0, 'quoteAmount': 21, 'tokenAmount': 21,
-            'txSigner': WALLET, 'timestamp': 1000, 'poolFeeRate': 0.0125,
-            'signature': 'launch', **extra}
+    result = {'action': action, 'mint': MINT, 'quoteMint': WSOL, 'pool': 'pump',
+              'mayhemMode': False, 'price': 1.0, 'quoteAmount': 21, 'tokenAmount': 21,
+              'txSigner': WALLET, 'timestamp': 1000, 'poolFeeRate': 0.0125,
+              'poolId': 'pump-pool', 'signature': 'launch', **extra}
+    result.setdefault('postBalances', {result['txSigner']: {result['mint']: result['tokenAmount']}})
+    return result
 
 
 class ConfigTests(unittest.TestCase):
+    def test_original_strategy_defaults_restored(self):
+        cfg = load_config(ROOT / 'config.example.toml')
+        self.assertEqual(cfg['trade']['sell_slippage'], 99)
+        self.assertEqual(cfg['sell']['slippage'], 100)
+        self.assertEqual(cfg['trade']['confirmation_seconds'], 3)
+        self.assertEqual(cfg['backtest']['hours'], 10)
+        self.assertNotIn('max_positions', cfg['trade'])
+        self.assertNotIn('first_buy_only', cfg['copytrader'])
+
     def test_example_config_valid_and_secret_free(self):
         cfg = load_config(ROOT / 'config.example.toml')
         self.assertEqual(cfg['trade']['quote_mint'], WSOL)
@@ -110,11 +121,45 @@ class StrategyTests(unittest.IsolatedAsyncioTestCase):
         strategy = Copytrader(self.cfg, self.trader)
         await strategy.on_event(event('buy', mayhemMode=True))
         self.assertFalse(strategy.positions)
-        self.cfg['copytrader']['first_buy_only'] = True
         await strategy.on_event(event('buy', postBalances={WALLET: {MINT: 1000}}))
         self.assertFalse(strategy.positions)
         await strategy.on_event(event('buy', postBalances={WALLET: {MINT: 21}}))
         self.assertIn(MINT, strategy.positions)
+
+    async def test_original_first_buy_sums_all_transaction_wallets(self):
+        strategy = Copytrader(self.cfg, self.trader)
+        await strategy.on_event(event('buy', postBalances={WALLET: {MINT: 21}, OTHER: {MINT: 5}}))
+        self.assertFalse(strategy.positions)  # Matched wallet alone looks like a first buy, total does not.
+        await strategy.on_event(event('buy', postBalances={WALLET: {MINT: 10}, OTHER: {MINT: 11}}))
+        self.assertIn(MINT, strategy.positions)
+
+    async def test_sol_and_usdc_sizing_updates_from_original_pool(self):
+        for cls in (Copytrader, Sniper):
+            strategy = cls(self.cfg, self.trader)
+            await strategy.on_event(event('buy', poolId=SOL_USDC_POOL, price=.01))
+            # At $100/SOL, 0.001 SOL sniper size = $0.10; copy cap = $1.
+            await strategy.on_event(event('buy' if cls is Copytrader else 'create',
+                                          quoteMint=USDC, quoteAmount=2100, price=1,
+                                          tokenAmount=2100))
+            self.assertAlmostEqual(strategy.positions[MINT]['tokens'], 1 if cls is Copytrader else .1)
+
+    async def test_bots_have_no_three_position_cap(self):
+        for cls in (Copytrader, Sniper):
+            strategy = cls(self.cfg, self.trader)
+            for mint in ('token-a', 'token-b', 'token-c', 'token-d'):
+                await strategy.on_event(event('buy' if cls is Copytrader else 'create', mint=mint))
+            self.assertEqual(len(strategy.positions), 4)
+
+    async def test_proportional_exits_avoid_original_rounding_drift(self):
+        strategy = Copytrader(self.cfg, self.trader)
+        await strategy.on_event(event('buy', tokenAmount=100))
+        initial = strategy.positions[MINT]['tokens']
+        await strategy.on_event(event('sell', tokenAmount=1.1))
+        self.assertAlmostEqual(strategy.positions[MINT]['tokens'] / initial, .989)
+        await strategy.on_event(event('sell', tokenAmount=28.9))
+        self.assertAlmostEqual(strategy.positions[MINT]['tokens'] / initial, .7)
+        await strategy.on_event(event('sell', tokenAmount=20))
+        self.assertAlmostEqual(strategy.positions[MINT]['tokens'] / initial, .5)
 
     async def test_sniper_take_profit_and_buy_once(self):
         self.cfg['sniper']['token_mint'] = MINT
@@ -144,20 +189,21 @@ class StrategyTests(unittest.IsolatedAsyncioTestCase):
             await strategy.on_event(value)
         self.assertFalse(strategy.positions)
 
-    def test_backtest_latency_slippage_and_window_end(self):
+    def test_backtest_original_latency_slippage_and_window_end(self):
         strategy = Backtest(self.cfg)
         strategy.handle_event(event())
-        strategy.handle_event(event('buy', timestamp=1500, price=1.3))
+        strategy.handle_event(event('buy', timestamp=1200, price=1.3))
+        strategy.handle_event(event('buy', timestamp=1500, price=1.0))
         self.assertEqual(strategy.missed, 1)
         self.assertFalse(strategy.positions)
         strategy = Backtest(self.cfg)
         strategy.handle_event(event())
         strategy.finish()
-        self.assertFalse(strategy.trades) # No synthetic buy after replay ended.
+        self.assertEqual(len(strategy.trades), 1)  # Upstream forces the in-flight buy to fill.
         strategy = Backtest(self.cfg)
         strategy.handle_event(event())
         strategy.handle_event(event('buy', timestamp=1500, price=1.1))
-        self.assertAlmostEqual(strategy.positions[MINT]['entry'], 1.1)
+        self.assertAlmostEqual(strategy.positions[MINT]['entry_price'], 1.0)
         strategy.handle_event(event('sell', timestamp=2000, price=1.7))
         strategy.handle_event(event('sell', timestamp=2500, price=1.8))
         self.assertEqual(len(strategy.trades), 1)
@@ -183,6 +229,52 @@ class StrategyTests(unittest.IsolatedAsyncioTestCase):
 
 
 class StreamIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_other_token_executes_while_first_buy_waits(self):
+        cfg = copy.deepcopy(DEFAULTS)
+        cfg['copytrader']['wallets'] = [WALLET]
+        first_started, second_started, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        class WaitingTrader(Trader):
+            async def order(self, action, mint, quote, amount, price, tokens=0):
+                if mint == MINT:
+                    first_started.set()
+                    await release.wait()
+                else:
+                    second_started.set()
+                return await super().order(action, mint, quote, amount, price, tokens)
+
+        async def stream(request):
+            socket = web.WebSocketResponse()
+            await socket.prepare(request)
+            await socket.send_json(event('buy', signature='first'))
+            await socket.send_json(event('buy', mint=OTHER, signature='second'))
+            async for _ in socket:
+                pass
+            return socket
+
+        app = web.Application()
+        app.router.add_get('/', stream)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, '127.0.0.1', 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        cfg['network']['stream_url'] = f'ws://127.0.0.1:{port}/'
+        trader = WaitingTrader(cfg, object())
+        strategy = Copytrader(cfg, trader)
+        task = asyncio.create_task(run_stream(cfg, trader, strategy.on_event, strategy.on_tick, strategy.accept_event))
+        try:
+            await asyncio.wait_for(first_started.wait(), 2)
+            await asyncio.wait_for(second_started.wait(), 2)
+            self.assertFalse(release.is_set())
+            self.assertIn(OTHER, strategy.positions)
+            self.assertNotIn(MINT, strategy.positions)
+        finally:
+            release.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await runner.cleanup()
+
     async def test_copy_fill_received_while_strategy_waits(self):
         cfg = copy.deepcopy(DEFAULTS)
         cfg['copytrader']['wallets'] = [WALLET]
@@ -221,9 +313,10 @@ class StreamIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 async with aiohttp.ClientSession() as session:
                     trader = Trader(cfg, session, live=True)
                     strategy = Copytrader(cfg, trader)
-                    async def on_tick():
+                    async def on_tick(mint=None):
                         if MINT in strategy.positions:
                             completed.set()
+                        return mint in strategy.positions
                     task = asyncio.create_task(run_stream(cfg, trader, strategy.on_event, on_tick))
                     try:
                         await asyncio.wait_for(completed.wait(), timeout=3)
@@ -304,6 +397,7 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
             await sell_selected(self.cfg, self.session, True, False)
             self.assertEqual(post.call_args_list[1].args[2]['guaranteedDelivery'], 'true')
             self.assertEqual(post.call_args_list[1].args[2]['amount'], '100%')
+            self.assertEqual(post.call_args_list[1].args[2]['slippage'], 100)
             post.side_effect = [ {'tokenBalances': {MINT: {'balance': 10}}}, {'confirmed': False} ]
             with self.assertRaises(StopBot):
                 await sell_selected(self.cfg, self.session, True, False)
