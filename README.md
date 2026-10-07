@@ -64,7 +64,7 @@ No credentials are needed:
 python scripts/backtest_sniper_strategy.py --hours 10
 ```
 
-Downloads the last ten completed UTC hours by default, one temporary file at a time, then streams their events. Use `--hours 1` for a shorter run. Archives can be hundreds of MB per hour. Missing hours fail the run unless `backtest.allow_gaps = true`.
+Downloads the last ten completed UTC hours by default, one temporary file at a time, then streams their events. Use `--hours 1` for a shorter run. Archives can be hundreds of MB or larger per hour; keep temporary storage available, or set `TMPDIR` to a folder with space. Missing hours fail the run unless `backtest.allow_gaps = true`.
 
 You can also replay an existing JSONL or Zstandard-compressed archive without network access:
 

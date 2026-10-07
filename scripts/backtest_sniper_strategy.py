@@ -192,9 +192,12 @@ async def download_hour(session, cfg, hour, destination):
         if response.status != 200:
             raise StopBot(f'Archive download returned HTTP {response.status}; use --file or choose another window')
         # Download to a temporary file instead of keeping a whole hour in RAM.
-        with Path(destination).open('wb') as file:
-            async for chunk in response.content.iter_chunked(1 << 20):
-                file.write(chunk)
+        try:
+            with Path(destination).open('wb') as file:
+                async for chunk in response.content.iter_chunked(1 << 20):
+                    file.write(chunk)
+        except OSError as exc:
+            raise StopBot('Cannot write archive to temporary storage. Free space, set TMPDIR to a writable folder with space, or use --file') from exc
     return True
 
 

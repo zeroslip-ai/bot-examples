@@ -14,8 +14,10 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from aiohttp import web
+import aiohttp
 import zstandard
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -284,3 +286,15 @@ class CliIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn('Skipping missing archive hour', output.decode())
             else:
                 self.assertIn('Archive download returned HTTP 404', output.decode())
+
+    async def test_archive_storage_failure_explains_tmpdir(self):
+        sys.path.insert(0, str(ROOT/'scripts'))
+        from bot_common import load_config, StopBot
+        from backtest_sniper_strategy import download_hour
+        from datetime import datetime, timezone
+        cfg = load_config(self.config)
+        ctx = ssl.create_default_context(cafile=str(self.cert))
+        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=ctx)) as session:
+            with patch('backtest_sniper_strategy.Path.open', side_effect=OSError(122, 'Disk quota exceeded')):
+                with self.assertRaisesRegex(StopBot, 'TMPDIR'):
+                    await download_hour(session, cfg, datetime.now(timezone.utc), self.path/'archive.zst')
