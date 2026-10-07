@@ -22,6 +22,8 @@ On Windows, activate with `.venv\Scripts\activate` instead. On Debian/Ubuntu, in
 
 The scripts print status and trade messages to your terminal. `config.toml` and `.env` are ignored by Git.
 
+Run one streaming bot at a time and close other live-stream clients first. The feed can reject a second connection, including a locally running agent's stream.
+
 ## Buy a specific token and manage exits
 
 Set `trade.buy_amount` in `config.toml` (default **0.001 SOL**), then replace `TOKEN_MINT` with a real token address:
@@ -32,7 +34,7 @@ python scripts/live_sniper_bot.py --mint TOKEN_MINT
 
 This starts in **paper mode**: at the next trade for that mint against SOL or USDC, it simulates one buy, then manages the configured take-profit, stop-loss, and idle exit. It does not send API requests or trades. The selected-token mode can watch any supported venue with SOL or USDC quotes. It buys that mint once per process, rather than re-entering after an exit.
 
-You can put the mint in `sniper.token_mint` instead of passing `--mint`. `sniper.take_profit`, `stop_loss`, and `idle_seconds` control exits.
+You can put the mint in `sniper.token_mint` instead of passing `--mint`. `sniper.take_profit`, `stop_loss`, and `idle_seconds` control exits. Prices from SOL and USDC pools are converted into the entry quote before checking exits; prices in other quote assets are ignored.
 
 For new Pump.fun launch sniping, leave `sniper.token_mint` empty and omit `--mint`:
 
@@ -52,7 +54,7 @@ python scripts/copytrader_bot.py --wallet WALLET_ADDRESS
 
 Or set `copytrader.wallets = ["ADDRESS_1", "ADDRESS_2"]` in `config.toml` and omit `--wallet`. The CLI option is repeatable and replaces the configured list.
 
-The bot copies `copytrader.buy_fraction` of a watched buy, up to `max_buy_amount` (defaults: 10%, capped at 0.01 SOL). It mirrors proportional exits from the same followed wallet, including partial sells. Additional buys by that wallet adjust the tracked exit baseline without buying more in your wallet. The first followed wallet to open a position owns that position's exit signals; another watched wallet cannot close it.
+The bot copies `copytrader.buy_fraction` of an observed buy event, up to `max_buy_amount` (defaults: 10%, capped at 0.01 SOL). The original entry sizing uses the aggregate event amount when a transaction bundles several traders. It mirrors proportional exits from the same followed wallet, including partial sells. Additional buys by that wallet adjust the tracked exit baseline without buying more in your wallet. The first followed wallet to open a position owns that position's exit signals; another watched wallet cannot close it. Wallet matching uses `tradersInvolved` when present. Bundled exits and additional buys use that wallet's `breakdown` amounts; an ambiguous bundled exit without a breakdown is skipped.
 
 Optional `copytrader.token_mints` limits trading to specific mints. The original first-buy gate is always applied: token balances summed across all wallets in the transaction must match the purchased amount within the upstream tolerance. Copy mode uses the same Pump pool filters as launch sniping and supports both SOL and USDC.
 
@@ -64,7 +66,7 @@ No credentials are needed:
 python scripts/backtest_sniper_strategy.py --hours 10
 ```
 
-Downloads the last ten completed UTC hours by default, one temporary file at a time, then streams their events. Use `--hours 1` for a shorter run. Archives can be hundreds of MB per hour. Missing hours fail the run unless `backtest.allow_gaps = true`.
+Downloads the last ten completed UTC hours by default, one temporary file at a time, then streams their events. Use `--hours 1` for a shorter run. Archives can be hundreds of MB or larger per hour; keep temporary storage available, or set `TMPDIR` to a folder with space. Missing hours fail the run unless `backtest.allow_gaps = true`.
 
 You can also replay an existing JSONL or Zstandard-compressed archive without network access:
 

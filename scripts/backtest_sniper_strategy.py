@@ -3,6 +3,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 import io
 import logging
+import math
 from pathlib import Path
 import tempfile
 
@@ -149,6 +150,33 @@ def read_lines(reader, strategy):
             strategy.skipped += 1
             continue
         try:
+            # Reject invalid input before handle_event changes timestamps/positions.
+            ts = event.get('timestamp')
+            if isinstance(ts, bool) or not isinstance(ts, (int, float)) or not math.isfinite(ts) or ts < 0:
+                raise ValueError('Invalid timestamp')
+            if not isinstance(event.get('action'), str):
+                raise ValueError('Invalid action')
+            fields = []
+            launch = event['action'] == 'create' and event.get('pool') == 'pump' and not event.get('mayhemMode')
+            if launch:
+                fields.append('quoteAmount')
+                amount = event.get('quoteAmount')
+                if isinstance(amount, (int, float)) and strategy.quotes.supports(event.get('quoteMint')) and (
+                        amount > strategy.quotes.amount(event['quoteMint'], strategy.cfg['sniper']['min_initial_buy'])):
+                    fields.extend(('price', 'poolFeeRate'))
+            elif event.get('mint') in strategy.positions and event['action'] in ('buy', 'sell', 'add', 'remove', 'migrate') and (
+                    event.get('pool') == 'pump' or (event.get('pool') == 'pump-amm' and event.get('poolCreatedBy') == 'pump')):
+                fields.extend(('price', 'poolFeeRate'))
+            for field in fields:
+                if field not in event:
+                    raise ValueError(f'Missing {field}')
+                value = event[field]
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                    raise ValueError(f'Invalid {field}')
+                if (field == 'price' and value <= 0) or (field != 'price' and value < 0):
+                    raise ValueError(f'Invalid {field}')
+                if field == 'poolFeeRate' and value >= 1:
+                    raise ValueError('Invalid pool fee')
             strategy.handle_event(event)
         except (KeyError, TypeError, ValueError, ZeroDivisionError):
             strategy.skipped += 1
@@ -164,9 +192,12 @@ async def download_hour(session, cfg, hour, destination):
         if response.status != 200:
             raise StopBot(f'Archive download returned HTTP {response.status}; use --file or choose another window')
         # Download to a temporary file instead of keeping a whole hour in RAM.
-        with Path(destination).open('wb') as file:
-            async for chunk in response.content.iter_chunked(1 << 20):
-                file.write(chunk)
+        try:
+            with Path(destination).open('wb') as file:
+                async for chunk in response.content.iter_chunked(1 << 20):
+                    file.write(chunk)
+        except OSError as exc:
+            raise StopBot('Cannot write archive to temporary storage. Free space, set TMPDIR to a writable folder with space, or use --file') from exc
     return True
 
 
