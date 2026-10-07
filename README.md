@@ -32,7 +32,7 @@ python scripts/live_sniper_bot.py --mint TOKEN_MINT
 
 This starts in **paper mode**: at the next trade for that mint against SOL or USDC, it simulates one buy, then manages the configured take-profit, stop-loss, and idle exit. It does not send API requests or trades. The selected-token mode can watch any supported venue with SOL or USDC quotes. It buys that mint once per process, rather than re-entering after an exit.
 
-You can put the mint in `sniper.token_mint` instead of passing `--mint`. `sniper.take_profit`, `stop_loss`, and `idle_seconds` control exits.
+You can put the mint in `sniper.token_mint` instead of passing `--mint`. `sniper.take_profit`, `stop_loss`, and `idle_seconds` control exits. Prices from SOL and USDC pools are converted into the entry quote before checking exits; prices in other quote assets are ignored.
 
 For new Pump.fun launch sniping, leave `sniper.token_mint` empty and omit `--mint`:
 
@@ -52,7 +52,7 @@ python scripts/copytrader_bot.py --wallet WALLET_ADDRESS
 
 Or set `copytrader.wallets = ["ADDRESS_1", "ADDRESS_2"]` in `config.toml` and omit `--wallet`. The CLI option is repeatable and replaces the configured list.
 
-The bot copies `copytrader.buy_fraction` of a watched buy, up to `max_buy_amount` (defaults: 10%, capped at 0.01 SOL). It mirrors proportional exits from the same followed wallet, including partial sells. Additional buys by that wallet adjust the tracked exit baseline without buying more in your wallet. The first followed wallet to open a position owns that position's exit signals; another watched wallet cannot close it.
+The bot copies `copytrader.buy_fraction` of an observed buy event, up to `max_buy_amount` (defaults: 10%, capped at 0.01 SOL). The original entry sizing uses the aggregate event amount when a transaction bundles several traders. It mirrors proportional exits from the same followed wallet, including partial sells. Additional buys by that wallet adjust the tracked exit baseline without buying more in your wallet. The first followed wallet to open a position owns that position's exit signals; another watched wallet cannot close it. Wallet matching uses `tradersInvolved` when present. Bundled exits and additional buys use that wallet's `breakdown` amounts; an ambiguous bundled exit without a breakdown is skipped.
 
 Optional `copytrader.token_mints` limits trading to specific mints. The original first-buy gate is always applied: token balances summed across all wallets in the transaction must match the purchased amount within the upstream tolerance. Copy mode uses the same Pump pool filters as launch sniping and supports both SOL and USDC.
 

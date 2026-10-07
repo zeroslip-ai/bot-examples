@@ -4,7 +4,7 @@ import time
 
 import aiohttp
 
-from bot_common import QuoteSizing, Trader, positive, run, run_stream, setup, trusted_pool
+from bot_common import QuoteSizing, Trader, WSOL, positive, run, run_stream, setup, trusted_pool
 
 
 class Sniper:
@@ -43,11 +43,14 @@ class Sniper:
         self.positions[mint]['last'] = self.clock()
         if event.get('action') not in ('buy', 'sell', 'add', 'remove'):
             return
-        if not price:
+        if not price or not self.quotes.supports(quote):
             return
         if not selected and not trusted_pool(event):
             return
         position = self.positions[mint]
+        # Compare prices in the position's entry quote, even across SOL/USDC pools.
+        if quote != position['quote']:
+            price = price / self.quotes.sol_price if quote != WSOL else price * self.quotes.sol_price
         position.update(price=price, last=self.clock())
         change = (price - position['entry']) / position['entry'] * 100
         if change > self.cfg['sniper']['take_profit'] or change < -self.cfg['sniper']['stop_loss']:

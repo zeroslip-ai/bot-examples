@@ -15,12 +15,31 @@ class Copytrader:
     def watched_wallet(self, event):
         watched = self.cfg['copytrader']['wallets']
         signer = event.get('txSigner')
+        involved = event.get('tradersInvolved')
+        if isinstance(involved, dict):
+            # Explicit traders take precedence over a fee payer in postBalances.
+            owner = self.positions.get(event.get('mint'), {}).get('wallet')
+            if owner in involved:
+                return owner
+            if signer in watched and signer in involved:
+                return signer
+            return next((wallet for wallet in watched if wallet in involved), None)
         if signer in watched:
             return signer
-        # Original wallet matching also covers another trader in postBalances.
-        involved = event.get('tradersInvolved') or {}
+        # Older events without tradersInvolved retain the original fallback.
         balances = event.get('postBalances') or {}
-        return next((wallet for wallet in watched if wallet in involved or wallet in balances), None)
+        return next((wallet for wallet in watched if wallet in balances), None)
+
+    @staticmethod
+    def wallet_quantity(event, wallet):
+        breakdown = event.get('breakdown')
+        if isinstance(breakdown, list):
+            return sum(positive(trade.get('tokenAmount')) for trade in breakdown
+                       if isinstance(trade, dict) and trade.get('trader') == wallet
+                       and trade.get('action') == event['action'])
+        if len(event.get('tradersInvolved') or {}) > 1:
+            return None  # An aggregate amount cannot identify this wallet's exit.
+        return positive(event.get('tokenAmount'))
 
     async def on_event(self, event):
         if not self.accept_event(event):
@@ -36,7 +55,9 @@ class Copytrader:
         if event['action'] == 'buy':
             if mint in self.positions:
                 if wallet == self.positions[mint]['wallet']:
-                    self.positions[mint]['copied_remaining'] += quantity
+                    owned_quantity = self.wallet_quantity(event, wallet)
+                    if owned_quantity is not None:
+                        self.positions[mint]['copied_remaining'] += owned_quantity
                 return
             balances = (event.get('postBalances') or {}).get(wallet, {})
             balance = positive(balances.get(mint))
@@ -55,6 +76,12 @@ class Copytrader:
             position = self.positions[mint]
             if wallet != position['wallet']:
                 return  # A different watched wallet must not close this position.
+            quantity = self.wallet_quantity(event, wallet)
+            if quantity is None:
+                logging.warning('Skipped ambiguous bundled exit mint=%s; no per-wallet breakdown', mint)
+                return
+            if quantity <= 0:
+                return
             fraction = min(1.0, quantity / position['copied_remaining'])
             percent = min(100.0, fraction * 100)
             amount = '100%' if fraction >= 1 else f'{percent:.8f}%'
