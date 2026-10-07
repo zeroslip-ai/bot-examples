@@ -22,6 +22,8 @@ On Windows, activate with `.venv\Scripts\activate` instead. On Debian/Ubuntu, in
 
 The scripts print status and trade messages to your terminal. `config.toml` and `.env` are ignored by Git.
 
+Run one streaming bot at a time and close other live-stream clients first. The feed can reject a second connection, including a locally running agent's stream.
+
 ## Buy a specific token and manage exits
 
 Set `trade.buy_amount` in `config.toml` (default **0.001 SOL**), then replace `TOKEN_MINT` with a real token address:
