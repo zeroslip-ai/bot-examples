@@ -1,5 +1,7 @@
 # ZeroSlip bot examples
 
+![ZeroSlip bot examples](assets/bot-examples-banner.png)
+
 Standalone Python bots for ZeroSlip's Trade API, live Data Stream, and Historical Replay. No PumpApi-Agent harness, AI agent, notification service, or source edits are required. Configure a token or watched wallets, then run a script from your terminal.
 
 [Bot examples guide](https://docs.zeroslip.ai/bot-examples) · [Quick Start](https://docs.zeroslip.ai/quick-start) · [Full docs for AI](https://docs.zeroslip.ai/llms-full.txt)
