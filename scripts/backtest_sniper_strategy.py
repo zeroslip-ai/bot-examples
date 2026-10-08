@@ -168,6 +168,8 @@ class Backtest:
             sum(t['fee_sol'] for t in self.trades),
         )
         count = len(self.trades)
+        if not count:
+            logging.info('No trades filled in this window; check missed entries and your entry/slippage settings.')
         reasons = Counter(t['reason'] for t in self.trades)
         logging.info(
             'Exits: tp=%s sl=%s idle=%s end=%s; win_rate=%.2f%%',
@@ -271,6 +273,35 @@ STORAGE_ERROR = (
 )
 
 
+class ArchiveFile:
+    """Translate only file I/O errors; preserve a failing download during close."""
+
+    def __init__(self, destination):
+        self.destination = destination
+
+    @staticmethod
+    def storage_call(method, *args):
+        try:
+            return method(*args)
+        except OSError as exc:
+            raise StopBot(STORAGE_ERROR) from exc
+
+    def __enter__(self):
+        self.file = self.storage_call(Path(self.destination).open, 'wb')
+        return self
+
+    def write(self, chunk):
+        self.storage_call(self.file.write, chunk)
+
+    def __exit__(self, error_type, error, traceback):
+        try:
+            self.storage_call(self.file.close)
+        except StopBot:
+            if error_type is None:
+                raise
+            logging.warning('Archive close also failed; preserving the original error')
+
+
 async def download_hour(session, cfg, hour, destination):
     url = f'{cfg["network"]["replay_url"].rstrip("/")}/{hour:%Y/%m/%d/%H}.jsonl.zst'
     logging.info('Downloading archive %s UTC', hour.strftime('%Y-%m-%d %H:00'))
@@ -286,22 +317,9 @@ async def download_hour(session, cfg, hour, destination):
                     else '; use --file'
                 )
                 raise StopBot(f'Archive download returned HTTP {response.status}{hint}')
-            # Keep network iteration outside the storage exception handlers.
-            try:
-                file = Path(destination).open('wb')
-            except OSError as exc:
-                raise StopBot(STORAGE_ERROR) from exc
-            try:
+            with ArchiveFile(destination) as file:
                 async for chunk in response.content.iter_chunked(1 << 20):
-                    try:
-                        file.write(chunk)
-                    except OSError as exc:
-                        raise StopBot(STORAGE_ERROR) from exc
-            finally:
-                try:
-                    file.close()
-                except OSError as exc:
-                    raise StopBot(STORAGE_ERROR) from exc
+                    file.write(chunk)
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
         raise StopBot(f'Archive network failure: {type(exc).__name__}: {exc}; retry or use --file') from exc
     return True

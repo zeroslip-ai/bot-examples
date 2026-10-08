@@ -1,3 +1,16 @@
+[project]
+name = "zeroslip-bot-examples"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "aiohttp>=3.12,<4",
+    "websockets>=15,<16",
+    "cachetools>=5.5,<8",
+    "python-dotenv>=1.1,<2",
+    "orjson>=3.10,<4",
+    "zstandard>=0.23,<1",
+]
+
 [tool.ruff]
 line-length = 120
 extend-exclude = ["tests/fixtures"]

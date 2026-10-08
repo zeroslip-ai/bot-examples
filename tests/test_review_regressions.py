@@ -7,15 +7,17 @@ import io
 import json
 from pathlib import Path
 import tempfile
+import tomllib
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'scripts'))
 
-from bot_common import DEFAULTS, StopBot, Trader, USDC, WSOL, run, run_stream
+from bot_common import DEFAULTS, StopBot, Trader, USDC, WSOL, load_config, run, run_stream, setup
 from backtest_sniper_strategy import Backtest, download_hour, read_lines
+from copytrader_bot import Copytrader
 from live_sniper_bot import Sniper
 from sell_all_tokens import select_balances
 from test_bots import deliver
@@ -168,3 +170,133 @@ class ArchiveErrors(unittest.IsolatedAsyncioTestCase):
                     Session(), copy.deepcopy(DEFAULTS), datetime.now(timezone.utc), Path(folder) / 'hour'
                 )
         self.assertNotIn('temporary storage', str(caught.exception))
+
+
+class SetupCompatibilityTests(unittest.TestCase):
+    def test_uv_and_pip_use_the_same_runtime_dependencies(self):
+        project = tomllib.loads((ROOT / 'pyproject.toml').read_text())
+        self.assertEqual(
+            sorted(project['project']['dependencies']), sorted((ROOT / 'requirements.txt').read_text().splitlines())
+        )
+
+    def test_legacy_quote_setting_is_ignored_with_a_warning(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'config.toml'
+            path.write_text('[trade]\nquote_mint = "' + USDC + '"\nbuy_amount = 0.002\n')
+            with self.assertLogs('bot_common', level='WARNING') as logs:
+                cfg = load_config(path)
+        self.assertNotIn('quote_mint', cfg['trade'])
+        self.assertEqual(cfg['trade']['buy_amount'], 0.002)
+        self.assertIn('deprecated trade.quote_mint', logs.output[0])
+
+    def test_no_config_file_uses_example_defaults_and_never_creates_a_file(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / 'config.example.toml').write_text((ROOT / 'config.example.toml').read_text())
+            with patch('bot_common.ROOT', root), patch('sys.argv', ['sniper', '--check-config']):
+                with self.assertRaises(SystemExit) as caught:
+                    setup('sniper')
+            self.assertEqual(caught.exception.code, 0)
+            self.assertFalse((root / 'config.toml').exists())
+
+    def test_existing_config_still_overrides_defaults(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / 'config.toml').write_text('[trade]\nbuy_amount = 0.002\n')
+            with patch('bot_common.ROOT', root), patch('sys.argv', ['sniper']):
+                cfg, args = setup('sniper')
+            self.assertEqual(args.config, root / 'config.toml')
+            self.assertEqual(cfg['trade']['buy_amount'], 0.002)
+
+
+class RoundedExitTests(unittest.IsolatedAsyncioTestCase):
+    async def make_strategy(self, tokens, decimals):
+        cfg = copy.deepcopy(DEFAULTS)
+        cfg['copytrader']['wallets'] = [market()['txSigner']]
+        trader = Trader(cfg, object(), live=True)
+        orders = []
+
+        async def order(action, mint, quote, amount, price, tokens_held=0):
+            orders.append(amount)
+            quantity = tokens if action == 'buy' else (tokens_held if amount == '100%' else amount)
+            return {'price': price, 'tokenAmount': quantity}
+
+        trader.order = order
+        strategy = Copytrader(cfg, trader)
+        await deliver(strategy, market(decimals=decimals))
+        return strategy, orders
+
+    async def test_live_partial_exits_round_down_to_mint_decimals(self):
+        for decimals, expected in [(0, 12.0), (6, 12.345678), (8, 12.3456789)]:
+            with self.subTest(decimals=decimals):
+                strategy, orders = await self.make_strategy(49.382715600000004, decimals)
+                await deliver(strategy, market('sell', tokenAmount=25))
+                self.assertEqual(orders[1], expected)
+                self.assertEqual(strategy.positions[MINT]['copied_remaining'], 75)
+                self.assertAlmostEqual(strategy.positions[MINT]['tokens'], 49.382715600000004 - expected)
+                await deliver(strategy, market('sell', tokenAmount=75))
+                self.assertEqual(orders[2], '100%')
+                self.assertFalse(strategy.positions)
+
+    async def test_subunit_exit_updates_followed_balance_without_a_zero_order(self):
+        strategy, orders = await self.make_strategy(0.01, 0)
+        await deliver(strategy, market('sell', tokenAmount=25))
+        self.assertEqual(len(orders), 1)
+        self.assertEqual(strategy.positions[MINT]['copied_remaining'], 75)
+        await deliver(strategy, market('sell', tokenAmount=75))
+        self.assertEqual(orders[-1], '100%')
+        self.assertFalse(strategy.positions)
+
+    async def test_missing_decimals_never_submits_an_unrounded_live_partial(self):
+        strategy, orders = await self.make_strategy(1, None)
+        with self.assertRaisesRegex(StopBot, 'Token decimals unavailable'):
+            await deliver(strategy, market('sell', tokenAmount=25))
+        self.assertEqual(len(orders), 1)
+        self.assertEqual(strategy.positions[MINT]['copied_remaining'], 100)
+
+
+class ArchiveCloseTests(unittest.IsolatedAsyncioTestCase):
+    async def download(self, file, read_error=None):
+        class Content:
+            async def iter_chunked(self, size):
+                yield b'first chunk'
+                if read_error:
+                    raise read_error
+
+        class Response:
+            status, content = 200, Content()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+        class Session:
+            def get(self, url):
+                return Response()
+
+        with patch('backtest_sniper_strategy.Path.open', return_value=file):
+            await download_hour(Session(), copy.deepcopy(DEFAULTS), datetime.now(timezone.utc), 'archive')
+
+    async def test_close_failure_does_not_hide_download_timeout(self):
+        file = Mock()
+        file.close.side_effect = OSError('close failed')
+        with self.assertRaisesRegex(StopBot, 'Archive network failure: TimeoutError'):
+            await self.download(file, asyncio.TimeoutError('read timed out'))
+        file.close.assert_called_once()
+
+    async def test_write_failure_survives_a_second_close_failure(self):
+        file = Mock()
+        file.write.side_effect = OSError('disk full')
+        file.close.side_effect = OSError('close failed')
+        with self.assertRaisesRegex(StopBot, 'Cannot write archive') as caught:
+            await self.download(file)
+        self.assertEqual(str(caught.exception.__cause__), 'disk full')
+
+    async def test_close_failure_after_success_is_a_storage_error(self):
+        file = Mock()
+        file.close.side_effect = OSError('flush failed')
+        with self.assertRaisesRegex(StopBot, 'Cannot write archive') as caught:
+            await self.download(file)
+        self.assertEqual(str(caught.exception.__cause__), 'flush failed')

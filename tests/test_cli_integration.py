@@ -40,6 +40,7 @@ def market(action='buy', **changes):
         pool='pump',
         poolId='fixture',
         poolFeeRate=0.0125,
+        decimals=6,
         timestamp=1000,
         txSigner=WALLET,
         tradersInvolved={WALLET: {}},
@@ -317,9 +318,10 @@ class CliIntegrationTests(unittest.IsolatedAsyncioTestCase):
             token_program: [account(MINT, 3), account(MINT, 7), account(WSOL, 2)],
             token_2022: [account(USDC, 4), account(OTHER, 4, 'frozen')],
         }
-        p = await self.start('sell_all_tokens.py', '--all')
+        p = await self.start('sell_all_tokens.py', '--wallet', WALLET, '--all')
         output, _ = await asyncio.wait_for(p.communicate(), 8)
         self.assertEqual(p.returncode, 0, output.decode())
+        self.assertTrue(all(r['params'][0] == WALLET for r in self.requests))
         self.assertIn(f'PREVIEW SELL 100% mint={MINT} balance=10.0', output.decode())
         self.assertIn('Skipping frozen balance', output.decode())
         self.assertEqual(len(self.requests), 2)

@@ -1,10 +1,11 @@
 """Copy configured wallets with capped buys and proportional exits."""
 
+from decimal import Decimal, ROUND_DOWN, localcontext
 import logging
 
 import aiohttp
 
-from bot_common import QuoteSizing, Trader, USDC, positive, run, run_stream, setup, trusted_pool
+from bot_common import QuoteSizing, StopBot, Trader, USDC, positive, run, run_stream, setup, trusted_pool
 
 
 class Copytrader:
@@ -46,7 +47,7 @@ class Copytrader:
 
     async def on_event(self, event):
         # Tracked queues also carry confirmations and non-trade market updates.
-        if event.get('action') not in ('buy', 'sell'):
+        if event.get('action') not in ('buy', 'sell') or not trusted_pool(event):
             return
         wallet = self.watched_wallet(event)
         mint, quote = event.get('mint'), event.get('quoteMint')
@@ -81,6 +82,7 @@ class Copytrader:
                 'quote': quote,
                 'tokens': positive(result['tokenAmount']),
                 'copied_remaining': balance or quantity,
+                'decimals': event.get('decimals'),
             }
         elif mint in self.positions:
             position = self.positions[mint]
@@ -95,6 +97,22 @@ class Copytrader:
             fraction = min(1.0, quantity / position['copied_remaining'])
             percent = min(100.0, fraction * 100)
             amount = '100%' if fraction >= 1 else position['tokens'] * fraction
+            if self.trader.live and fraction < 1:
+                decimals = position['decimals']
+                if not isinstance(decimals, int) or isinstance(decimals, bool) or not 0 <= decimals <= 255:
+                    raise StopBot('Token decimals unavailable; cannot size a partial copy exit. Check the wallet')
+                with localcontext() as context:
+                    context.prec = max(28, decimals + 20)
+                    exact = (
+                        Decimal(str(position['tokens']))
+                        * Decimal(str(quantity))
+                        / Decimal(str(position['copied_remaining']))
+                    )
+                    amount = float(exact.quantize(Decimal(1).scaleb(-decimals), rounding=ROUND_DOWN))
+                if amount == 0:
+                    position['copied_remaining'] = max(0, position['copied_remaining'] - quantity)
+                    logging.info('Skipped copy exit below one token unit mint=%s', mint)
+                    return
             if quote != position['quote']:
                 price = price / self.quotes.sol_price if quote == USDC else price * self.quotes.sol_price
             result = await self.trader.order('sell', mint, position['quote'], amount, price, position['tokens'])
