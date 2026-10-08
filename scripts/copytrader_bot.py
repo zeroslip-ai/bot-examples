@@ -1,9 +1,10 @@
 """Copy configured wallets with capped buys and proportional exits."""
+
 import logging
 
 import aiohttp
 
-from bot_common import QuoteSizing, Trader, positive, run, run_stream, setup, trusted_pool
+from bot_common import QuoteSizing, Trader, USDC, positive, run, run_stream, setup, trusted_pool
 
 
 class Copytrader:
@@ -34,15 +35,18 @@ class Copytrader:
     def wallet_quantity(event, wallet):
         breakdown = event.get('breakdown')
         if isinstance(breakdown, list):
-            return sum(positive(trade.get('tokenAmount')) for trade in breakdown
-                       if isinstance(trade, dict) and trade.get('trader') == wallet
-                       and trade.get('action') == event['action'])
+            return sum(
+                positive(trade.get('tokenAmount'))
+                for trade in breakdown
+                if isinstance(trade, dict) and trade.get('trader') == wallet and trade.get('action') == event['action']
+            )
         if len(event.get('tradersInvolved') or {}) > 1:
             return None  # An aggregate amount cannot identify this wallet's exit.
         return positive(event.get('tokenAmount'))
 
     async def on_event(self, event):
-        if not self.accept_event(event):
+        # Tracked queues also carry confirmations and non-trade market updates.
+        if event.get('action') not in ('buy', 'sell'):
             return
         wallet = self.watched_wallet(event)
         mint, quote = event.get('mint'), event.get('quoteMint')
@@ -65,13 +69,19 @@ class Copytrader:
             post_total = sum(positive(values.get(mint)) for values in (event.get('postBalances') or {}).values())
             if abs(post_total - quantity) > max(0.000001, quantity * 0.000001):
                 return
-            amount = min(positive(event.get('quoteAmount')) * self.cfg['copytrader']['buy_fraction'],
-                         self.quotes.amount(quote, self.cfg['copytrader']['max_buy_amount']))
+            amount = min(
+                positive(event.get('quoteAmount')) * self.cfg['copytrader']['buy_fraction'],
+                self.quotes.amount(quote, self.cfg['copytrader']['max_buy_amount']),
+            )
             if amount <= 0:
                 return
             result = await self.trader.order('buy', mint, quote, amount, price)
-            self.positions[mint] = {'wallet': wallet, 'quote': quote, 'tokens': positive(result['tokenAmount']),
-                                    'copied_remaining': balance or quantity}
+            self.positions[mint] = {
+                'wallet': wallet,
+                'quote': quote,
+                'tokens': positive(result['tokenAmount']),
+                'copied_remaining': balance or quantity,
+            }
         elif mint in self.positions:
             position = self.positions[mint]
             if wallet != position['wallet']:
@@ -84,7 +94,9 @@ class Copytrader:
                 return
             fraction = min(1.0, quantity / position['copied_remaining'])
             percent = min(100.0, fraction * 100)
-            amount = '100%' if fraction >= 1 else f'{percent:.8f}%'
+            amount = '100%' if fraction >= 1 else position['tokens'] * fraction
+            if quote != position['quote']:
+                price = price / self.quotes.sol_price if quote == USDC else price * self.quotes.sol_price
             result = await self.trader.order('sell', mint, position['quote'], amount, price, position['tokens'])
             position['tokens'] = max(0, position['tokens'] - positive(result['tokenAmount']))
             position['copied_remaining'] = max(0, position['copied_remaining'] - quantity)

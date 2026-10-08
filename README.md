@@ -21,7 +21,7 @@ On Windows, activate with `.venv\Scripts\activate`. On Debian/Ubuntu, install `p
 
 Run commands from the repository folder. Edit `config.toml` for amounts and strategy settings; [config.example.toml](config.example.toml) explains each option. **Streaming bots start in paper mode; sell commands start as previews.** Neither submits trades without `--live`.
 
-Run one streaming bot at a time and close other stream clients, including agents, to avoid the feed's connection limit.
+Run one streaming bot at a time and close other stream clients, including agents, to avoid the feed's connection limit. Reconnects log the cause and back off up to 30 seconds.
 
 ## Run an example
 
@@ -33,7 +33,9 @@ Replace `TOKEN_MINT` or `WALLET_ADDRESS` with a Solana address.
 python scripts/live_sniper_bot.py --mint TOKEN_MINT
 ```
 
-Buys once on that token's next SOL/USDC trade, then exits on take-profit, stop-loss, or inactivity. Set `trade.buy_amount` and `sniper.take_profit`, `stop_loss`, and `idle_seconds` in `config.toml`.
+Decides to buy on that token's next SOL/USDC trade, then exits on take-profit, stop-loss, or inactivity. Set `trade.buy_amount` and `sniper.take_profit`, `stop_loss`, and `idle_seconds` in `config.toml`.
+
+Paper sniper buys wait for a subsequent trade price and reject fills above `trade.buy_slippage`; migration events alone never fill an entry. Paper exits log PnL and a running realized total, excluding fees and depth. This is a smoke test, not a profitability estimate.
 
 ### Snipe new Pump.fun launches
 
@@ -59,7 +61,7 @@ python scripts/backtest_sniper_strategy.py --hours 1
 python scripts/backtest_sniper_strategy.py --file /path/to/events.jsonl.zst
 ```
 
-Replays completed UTC hours using the launch strategy and `[backtest]` latency/fee settings. It does not backtest selected-token mode. Archives can exceed hundreds of MB per hour; set `TMPDIR` if temporary storage is limited. Results are estimates; see [strategy notes](docs/strategy-notes.md) for model limitations.
+Replays completed UTC hours using the launch strategy and `[backtest]` latency/fee settings. It does not backtest selected-token mode. The newest hour may take 20–90 seconds to appear; retry a 404 after 90 seconds. Archives can exceed hundreds of MB per hour; set `TMPDIR` if temporary storage is limited. The report includes exit reasons, win rate, price moves, entry slippage, best/worst trades, and the replay window. Results are estimates; see [strategy notes](docs/strategy-notes.md) for model limitations.
 
 ### Preview or sell balances
 
@@ -71,7 +73,7 @@ python scripts/sell_all_tokens.py --mint TOKEN_MINT
 python scripts/sell_all_tokens.py --all
 ```
 
-Reads balances through Solana RPC. Frozen balances, wrapped SOL, and `trade.quote_mint` are skipped. Choose specific mints or `--all`, not both.
+Reads balances through Solana RPC. Frozen balances, wrapped SOL, and USDC are skipped. Choose specific mints or `--all`, not both.
 
 ## Trade live
 
@@ -100,9 +102,11 @@ Before trading:
 
 Give the agent this repository and the [full ZeroSlip API docs](https://docs.zeroslip.ai/llms-full.txt). Adjust configuration before strategy code. Every script requires [bot_common.py](scripts/bot_common.py); keep it alongside the entry points. [Strategy notes](docs/strategy-notes.md) explain entry filters and replay assumptions.
 
-Add `--check-config` to any example command to validate settings without network calls. Use `--help` for CLI options. For code changes, run the local test suite; it submits no real trades:
+Add `--check-config` to any example command to validate settings without network calls. Use `--help` for CLI options. For code changes, install the development tools and run lint and tests; they submit no real trades:
 
 ```sh
+python -m pip install -r requirements-dev.txt
+ruff check scripts tests
 python -m unittest discover -s tests -v
 ```
 

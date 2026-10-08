@@ -1,9 +1,10 @@
 """Preview or sell selected token balances; --all explicitly selects every token."""
+
 import logging
 
 import aiohttp
 
-from bot_common import WSOL, api_post, credentials, positive, run, setup, StopBot
+from bot_common import WSOL, USDC, api_post, credentials, positive, run, setup, StopBot
 
 TOKEN_PROGRAMS = (
     'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
@@ -22,10 +23,17 @@ async def balances(cfg, session, live):
         return result
     result = {}
     for program in TOKEN_PROGRAMS:
-        payload = {'jsonrpc': '2.0', 'id': 1, 'method': 'getTokenAccountsByOwner',
-                   'params': [cfg['wallet']['public_key'], {'programId': program},
-                              {'encoding': 'jsonParsed', 'commitment': 'confirmed'}]}
-        data = await api_post(session, cfg['network']['rpc_url'], payload)
+        payload = {
+            'jsonrpc': '2.0',
+            'id': 1,
+            'method': 'getTokenAccountsByOwner',
+            'params': [
+                cfg['wallet']['public_key'],
+                {'programId': program},
+                {'encoding': 'jsonParsed', 'commitment': 'confirmed'},
+            ],
+        }
+        data = await api_post(session, cfg['network']['rpc_url'], payload, rpc=True)
         accounts = data.get('result', {}).get('value')
         if not isinstance(accounts, list):
             raise StopBot('RPC did not return token accounts')
@@ -42,10 +50,13 @@ async def balances(cfg, session, live):
 
 def select_balances(cfg, holdings, all_tokens):
     wanted = cfg['sell']['token_mints']
-    # Do not turn the configured quote balance or WSOL back into itself.
-    excluded = {cfg['trade']['quote_mint'], WSOL}
-    return {mint: info for mint, info in holdings.items()
-            if mint not in excluded and (all_tokens or mint in wanted) and positive(info.get('balance'))}
+    # Preserve both trading quote assets, including explicit mint selections.
+    excluded = {WSOL, USDC}
+    return {
+        mint: info
+        for mint, info in holdings.items()
+        if mint not in excluded and (all_tokens or mint in wanted) and positive(info.get('balance'))
+    }
 
 
 async def sell_selected(cfg, session, live, all_tokens):
@@ -60,14 +71,25 @@ async def sell_selected(cfg, session, live, all_tokens):
         logging.info('%s SELL 100%% mint=%s balance=%s', 'LIVE' if live else 'PREVIEW', mint, info['balance'])
         if not live:
             continue
-        data = await api_post(session, cfg['network']['trade_url'], {
-            **credentials(), 'action': 'sell', 'mint': mint, 'amount': '100%',
-            'denominatedInQuote': 'false', 'slippage': cfg['sell']['slippage'],
-            'priorityFee': cfg['trade']['priority_fee'], 'guaranteedDelivery': 'true',
-        })
+        data = await api_post(
+            session,
+            cfg['network']['trade_url'],
+            {
+                **credentials(),
+                'action': 'sell',
+                'mint': mint,
+                'amount': '100%',
+                'denominatedInQuote': 'false',
+                'slippage': cfg['sell']['slippage'],
+                'priorityFee': cfg['trade']['priority_fee'],
+                'guaranteedDelivery': 'true',
+            },
+        )
         if data.get('confirmed') is not True or not data.get('signature'):
             raise StopBot('Sale not confirmed; check the wallet before retrying. No burn was attempted')
-        quote = next((trade.get('quoteMint') for trade in data.get('trades', []) if isinstance(trade, dict)), 'auto-selected')
+        quote = next(
+            (trade.get('quoteMint') for trade in data.get('trades', []) if isinstance(trade, dict)), 'auto-selected'
+        )
         logging.info('Sale confirmed mint=%s quote=%s signature=%s', mint, quote, data['signature'])
 
 

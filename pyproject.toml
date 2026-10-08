@@ -1,0 +1,9 @@
+[tool.ruff]
+line-length = 120
+extend-exclude = ["tests/fixtures"]
+
+[tool.ruff.lint]
+select = ["E9", "F", "B904", "B023", "E501"]
+
+[tool.ruff.format]
+quote-style = "single"
