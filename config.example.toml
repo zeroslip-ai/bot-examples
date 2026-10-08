@@ -3,7 +3,6 @@
 public_key = "" # Your wallet address; required for sell previews; live sells use the credential wallet.
 
 [trade]
-quote_mint = "So11111111111111111111111111111111111111112" # Quote balance preserved by sell-all; streaming bots support SOL + USDC.
 buy_amount = 0.001 # SOL-equivalent; USDC amounts convert using the trusted SOL/USDC stream pool.
 buy_slippage = 20
 sell_slippage = 99 # Original streaming sell tolerance
@@ -11,7 +10,7 @@ priority_fee = 0.0001 # SOL network priority fee
 confirmation_seconds = 3
 
 [sniper]
-token_mint = "" # Set a mint to buy once on its next trade; blank scans new Pump launches.
+token_mint = "" # Set a mint for one entry attempt; blank scans new Pump launches.
 min_initial_buy = 20 # SOL-equivalent; applies only to launch mode.
 take_profit = 50 # Percent price rise from entry
 stop_loss = 20 # Percent price fall from entry
