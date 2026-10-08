@@ -2,92 +2,47 @@
 
 ![ZeroSlip bot examples](assets/bot-examples-banner.png)
 
-Python scripts for sniping, copy trading, backtesting, and selling balances. Choose a token or watched wallets and run from your terminal.
+Four Python trading bots for Solana. Each one is a single file: settings at the top, code below. No config files or command-line arguments.
 
-## How it works
+| File | What it does |
+| --- | --- |
+| [`live_sniper_bot.py`](live_sniper_bot.py) | Buys a token you choose, or new Pump.fun launches, then sells at take profit, stop loss, or when the token goes quiet. |
+| [`copytrader_bot.py`](copytrader_bot.py) | Copies the first buy of wallets you watch, then copies their sells in the same proportion. |
+| [`backtest_sniper_strategy.py`](backtest_sniper_strategy.py) | Replays past hours of market data through the sniper rules and reports PnL. Never trades. |
+| [`sell_all_tokens.py`](sell_all_tokens.py) | Sells every token in a wallet, or only the ones you list. Keeps SOL and USDC. |
 
-Streaming bots read public ZeroSlip market events and apply their strategy rules. Paper mode logs simulated trades and PnL. With `LIVE = True`, the script sends orders and your credential to the [Lightning Trade API](https://docs.zeroslip.ai/trade-api), which signs and executes them. Backtesting reads historical events; sell previews query Solana RPC.
+## Run
 
-## Setup
-
-Download one file from [`standalone/`](standalone), open it, and edit the **SETTINGS** section at the top. Each file contains its own runtime; no other repository files, TOML, `.env`, or arguments are required.
-
-Use Python 3.11+ with these packages installed once in your Python environment:
-
-```sh
-python3 -m pip install 'aiohttp>=3.12,<4' 'websockets>=15,<16' 'cachetools>=5.5,<8' \
-  'orjson>=3.10,<4' 'zstandard>=0.23,<1'
-```
-
-Then run `python3 file.py` as shown below. Paper mode and read-only previews are the defaults. Run one streaming bot at a time; close other feed clients, including agents.
-
-If you prefer automatic dependency setup, install [uv](https://docs.astral.sh/uv/getting-started/installation/) and use `uv run file.py` instead. This also works when your system Python prevents package installation.
-
-## Examples
-
-Edit the Python settings at the top of your downloaded file. Addresses are Solana base58 addresses.
-
-### Buy a token or snipe launches
+1. Download one file.
+2. Open it and edit the **SETTINGS** section at the top.
+3. Install the packages once and run it:
 
 ```sh
+python3 -m pip install aiohttp websockets zstandard orjson
 python3 live_sniper_bot.py
 ```
 
-Set `CONFIG['sniper']['token_mint']` to buy a token, or leave it empty to snipe launches. Selected-token mode buys once and manages take-profit, stop-loss, and idle exits. In launch mode, it buys non-Mayhem launches over 20 SOL-equivalent and follows Pump-created PumpSwap pools. Defaults: 0.001 SOL-equivalent per buy, 50% take-profit, 20% stop-loss, 300 seconds idle.
+Python 3.11+. If your system Python blocks `pip install`, use [uv](https://docs.astral.sh/uv/) instead: `uv run live_sniper_bot.py` installs what the file needs.
 
-Paper entries wait for a subsequent trade price and count misses above buy slippage. Paper exits report realized PnL excluding fees and depth; results do not establish profitability.
+Every bot starts in paper mode (`LIVE = False`). It logs what it would buy and sell, and sends nothing.
 
-### Copy a wallet
+Run one streaming bot at a time. The data stream allows one connection per IP address.
 
-```sh
-python3 copytrader_bot.py
-```
+## How it works
 
-Set `CONFIG['copytrader']['wallets']` to the public wallets you follow. Copies first buys in non-Mayhem Pump.fun or Pump-created PumpSwap pools at 10% of the observed amount, capped at 0.01 SOL-equivalent, and mirrors proportional sells.
+- **Market data:** the sniper and copytrader open one websocket to the free [ZeroSlip data stream](https://docs.zeroslip.ai/stream). Trades arrive as JSON, and the bot filters them on your side.
+- **Orders:** with `LIVE = True`, the bot posts each order with your `API_KEY` or `PRIVATE_KEY` to the [ZeroSlip Trade API](https://docs.zeroslip.ai/trade-api), which signs and sends it. The bot then waits up to 3 seconds to see its own trade on the stream.
+- **Backtest:** downloads hourly archives from the ZeroSlip replay service and runs them through the same entry and exit rules.
+- **Sell all:** paper mode reads balances from public Solana RPC. Live mode asks the Trade API for the balances of your key's wallet (a small fee applies).
 
-### Backtest launch sniping
+Nothing else is contacted. The URLs are constants near the top of each file.
 
-```sh
-python3 backtest_sniper_strategy.py
-```
+## Before you trade live
 
-Set `CONFIG['backtest']['hours']` (default: 1), or `REPLAY_FILE` for a downloaded archive. Uses launch rules and modeled latency/fees. Reports PnL, misses, exit reasons, win rate, price moves, entry slippage, best/worst trades, and the replay window. Zero trades can mean every entry exceeded buy slippage. The newest hour may take 20–90 seconds to appear; retry a 404 after 90 seconds. Archives can exceed hundreds of MB per hour; use `TMPDIR` for temporary storage.
+- Put your key in the file only on a machine you trust, and don't share the file afterwards.
+- Check the slippage settings. Defaults are 20% for buys, 99% for sells, and 100% for sell-all.
+- Positions are kept in memory. Stopping the bot does not sell, and restarting does not remember open positions.
+- If an order's result is unclear, the bot stops instead of retrying. Check your wallet before restarting.
+- Paper and backtest results ignore some fees and liquidity. They are estimates, not a promise of profit.
 
-### Preview balances
-
-```sh
-python3 sell_all_tokens.py
-```
-
-Set `CONFIG['wallet']['public_key']` to the public wallet to preview. `SELL_ALL = True` selects every non-quote balance. To select specific tokens, set it to `False` and fill `CONFIG['sell']['token_mints']`. Frozen balances, wrapped SOL, and USDC are skipped.
-
-## Trade live
-
-Set `API_KEY` or `PRIVATE_KEY` at the top of your sniper, copytrader, or sell file, then set `LIVE = True`. API keys take precedence. Keep files containing credentials private. Live sells use the credential's wallet and incur a balance-query fee.
-
-- Review slippage: defaults are 20% for buys, 99% for streaming sells, and 100% for sell-all. Fund SOL and USDC to trade both quote markets.
-- Positions stay in memory. Stopping does not sell holdings; restarting does not restore them. Use one strategy per wallet.
-- Uncertain orders stop without retrying. Check the wallet before restarting. Reconnects back off up to 30 seconds but cannot recover missed events.
-
-## Work with a coding agent
-
-Give the agent a single-file example and the [full API docs](https://docs.zeroslip.ai/llms-full.txt). [Strategy notes](docs/strategy-notes.md) cover entry filters, proportional exits, and replay assumptions.
-
-<details>
-<summary>Repository development and CLI workflow</summary>
-
-The original `scripts/` entry points share `bot_common.py` and support flags, optional `config.toml`, and `.env`. Clone the repository, then use `uv run scripts/file.py --help` or `--check-config` to validate settings without network calls.
-
-The single files are generated from these same sources. After changing `scripts/`, regenerate and check:
-
-```sh
-uv run python tools/build_standalone.py
-uv run --with ruff==0.16.10 ruff check scripts tests tools standalone
-uv run python -m unittest discover -s tests -v
-```
-
-CI rejects stale single-file examples.
-
-</details>
-
-[Bot guide](https://docs.zeroslip.ai/bot-examples) · [Upstream sources](UPSTREAM.json) · [Unlicense](LICENSE)
+Full guide: [docs.zeroslip.ai/bot-examples](https://docs.zeroslip.ai/bot-examples). Public domain ([Unlicense](LICENSE)).
