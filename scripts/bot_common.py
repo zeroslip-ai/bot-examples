@@ -88,6 +88,12 @@ def load_config(path):
         if section not in cfg or not isinstance(values, dict):
             raise ConfigError(f'Unknown or invalid configuration section: {section}')
         for key, value in values.items():
+            if section == 'trade' and key == 'quote_mint':
+                logging.getLogger(__name__).warning(
+                    'Ignoring deprecated trade.quote_mint; SOL/USDC quotes come from each event. '
+                    'Remove this key from your config'
+                )
+                continue
             if key not in cfg[section]:
                 raise ConfigError(f'Unknown configuration option: {section}.{key}')
             default = cfg[section][key]
@@ -162,7 +168,7 @@ def credentials():
 
 def setup(kind):
     parser = argparse.ArgumentParser(description=f'ZeroSlip standalone {kind}; paper mode unless --live')
-    parser.add_argument('--config', type=Path, default=ROOT / 'config.toml')
+    parser.add_argument('--config', type=Path, help='Settings file; defaults to config.toml or config.example.toml')
     parser.add_argument('--check-config', action='store_true', help='Validate settings and exit without network calls')
     if kind != 'backtest':
         parser.add_argument('--live', action='store_true', help='Enable real Lightning trades using local credentials')
@@ -171,11 +177,14 @@ def setup(kind):
     if kind == 'copytrader':
         parser.add_argument('--wallet', action='append', help='Wallet to copy; repeat for several wallets')
     if kind == 'sell':
+        parser.add_argument('--wallet', help='Public wallet address for previews; live sells use the credential wallet')
         parser.add_argument('--all', action='store_true', help='Select every non-quote token balance')
     if kind == 'backtest':
         parser.add_argument('--hours', type=int, help='Number of completed UTC archive hours')
         parser.add_argument('--file', type=Path, help='Replay a local JSONL or JSONL.zst file instead of downloading')
     args = parser.parse_args()
+    if args.config is None:
+        args.config = ROOT / ('config.toml' if (ROOT / 'config.toml').exists() else 'config.example.toml')
     load_dotenv(args.config.resolve().parent / '.env', override=False)
     try:
         cfg = load_config(args.config)
@@ -185,13 +194,18 @@ def setup(kind):
                 cfg['sniper']['token_mint'] = args.mint
             else:
                 cfg['sell']['token_mints'] = [args.mint]
-        if getattr(args, 'wallet', None):
+        if kind == 'copytrader' and args.wallet:
             cfg['copytrader']['wallets'] = [address(w, '--wallet') for w in args.wallet]
+        if kind == 'sell' and args.wallet:
+            cfg['wallet']['public_key'] = address(args.wallet, '--wallet')
         if getattr(args, 'hours', None) is not None:
             if args.hours < 1:
                 raise ConfigError('--hours must be positive')
             cfg['backtest']['hours'] = args.hours
-        cfg['wallet']['public_key'] = os.getenv('ZEROSLIP_WALLET_PUBLIC_KEY', '').strip() or cfg['wallet']['public_key']
+        if not (kind == 'sell' and args.wallet):
+            cfg['wallet']['public_key'] = (
+                os.getenv('ZEROSLIP_WALLET_PUBLIC_KEY', '').strip() or cfg['wallet']['public_key']
+            )
         if cfg['wallet']['public_key']:
             address(cfg['wallet']['public_key'], 'wallet.public_key')
         if kind == 'copytrader' and not cfg['copytrader']['wallets']:
@@ -200,7 +214,9 @@ def setup(kind):
             raise ConfigError('Do not copy your own trading wallet')
         if kind == 'sell':
             if not args.live and not cfg['wallet']['public_key']:
-                raise ConfigError('Sell preview needs wallet.public_key or ZEROSLIP_WALLET_PUBLIC_KEY to read balances')
+                raise ConfigError(
+                    'Sell preview needs --wallet ADDRESS, wallet.public_key, or ZEROSLIP_WALLET_PUBLIC_KEY'
+                )
             if args.all and (args.mint or cfg['sell']['token_mints']):
                 raise ConfigError('Choose --all or specific token mints, not both')
             if not args.all and not cfg['sell']['token_mints']:

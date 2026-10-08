@@ -50,6 +50,7 @@ def event(action='create', **extra):
         'txSigner': WALLET,
         'timestamp': 1000,
         'poolFeeRate': 0.0125,
+        'decimals': 6,
         'poolId': 'pump-pool',
         'signature': 'launch',
         **extra,
@@ -59,7 +60,7 @@ def event(action='create', **extra):
 
 
 async def deliver(strategy, value, fill=True):
-    """Use the stream filter; entry tests include a subsequent trade at the same price."""
+    """Strategy convenience helper, not a queue model; stream regressions use run_stream."""
     if strategy.accept_event(value) or value.get('mint') in strategy.positions:
         await strategy.on_event(value)
     if fill and isinstance(strategy, Sniper) and value.get('mint') in strategy.pending:
