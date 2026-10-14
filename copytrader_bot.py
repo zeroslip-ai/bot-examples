@@ -86,6 +86,9 @@ def credentials():
 
 
 def check_settings():
+    numbers = (BUY_FRACTION, MAX_BUY_AMOUNT, BUY_SLIPPAGE, SELL_SLIPPAGE, PRIORITY_FEE)
+    if any(isinstance(n, bool) or not isinstance(n, (int, float)) or not math.isfinite(n) for n in numbers):
+        raise StopBot('Number settings must be finite numbers')
     if not isinstance(WALLETS, list) or not WALLETS:
         raise StopBot('Add the wallets you want to copy to WALLETS')
     for wallet in WALLETS:

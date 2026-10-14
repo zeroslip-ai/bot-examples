@@ -72,6 +72,9 @@ def credentials():
 
 
 def check_settings():
+    numbers = (SLIPPAGE, PRIORITY_FEE)
+    if any(isinstance(n, bool) or not isinstance(n, (int, float)) or not math.isfinite(n) for n in numbers):
+        raise StopBot('Number settings must be finite numbers')
     if not isinstance(LIVE, bool) or not isinstance(SELL_ALL, bool):
         raise StopBot('LIVE and SELL_ALL must be True or False')
     if WALLET:

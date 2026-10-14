@@ -84,6 +84,10 @@ def credentials():
 
 
 def check_settings():
+    numbers = (MIN_INITIAL_BUY, BUY_AMOUNT, TAKE_PROFIT, STOP_LOSS, IDLE_SECONDS,
+               BUY_SLIPPAGE, SELL_SLIPPAGE, PRIORITY_FEE)
+    if any(isinstance(n, bool) or not isinstance(n, (int, float)) or not math.isfinite(n) for n in numbers):
+        raise StopBot('Number settings must be finite numbers')
     try:
         if not (BUY_AMOUNT > 0 and TAKE_PROFIT > 0 and IDLE_SECONDS > 0 and 0 < STOP_LOSS < 100):
             raise StopBot('BUY_AMOUNT, TAKE_PROFIT and IDLE_SECONDS must be above 0; STOP_LOSS between 0 and 100')

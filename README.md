@@ -18,7 +18,7 @@ Four Python trading bots for Solana. Each one is a single file: settings at the 
 3. Install the packages once and run it:
 
 ```sh
-python3 -m pip install aiohttp websockets zstandard orjson
+python3 -m pip install 'aiohttp>=3.12,<4' 'websockets>=15,<16' 'zstandard>=0.23,<1' 'orjson>=3.10,<4'
 python3 live_sniper_bot.py
 ```
 
@@ -48,3 +48,9 @@ Nothing else is contacted. The URLs are constants near the top of each file.
 - Paper and backtest results ignore some fees and liquidity. They are estimates, not a promise of profit.
 
 Full guide: [docs.zeroslip.ai/bot-examples](https://docs.zeroslip.ai/bot-examples). Public domain ([Unlicense](LICENSE)).
+
+## Tests
+
+After installing the packages above, run `python3 -m unittest discover -s tests -v`.
+The tests run copied single files against local stream, Trade API, RPC, and replay servers.
+They use fake keys and send no real orders. GitHub Actions runs them on Python 3.9, 3.12, and 3.14.

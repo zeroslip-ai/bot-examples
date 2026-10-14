@@ -68,6 +68,10 @@ class StopBot(Exception):
 
 
 def check_settings():
+    numbers = (MIN_INITIAL_BUY, BUY_AMOUNT, TAKE_PROFIT, STOP_LOSS, IDLE_SECONDS,
+               BUY_SLIPPAGE, BUY_LATENCY_MS, SELL_LATENCY_MS, SERVICE_FEE, EXTRA_FEE)
+    if any(isinstance(n, bool) or not isinstance(n, (int, float)) or not math.isfinite(n) for n in numbers):
+        raise StopBot('Number settings must be finite numbers')
     try:
         if not (BUY_AMOUNT > 0 and TAKE_PROFIT > 0 and IDLE_SECONDS > 0 and 0 < STOP_LOSS < 100):
             raise StopBot('BUY_AMOUNT, TAKE_PROFIT and IDLE_SECONDS must be above 0; STOP_LOSS between 0 and 100')
@@ -196,8 +200,13 @@ class Backtest:
                 }
         elif mint in self.positions:
             pos = self.positions[mint]
-            if event['action'] in ('buy', 'sell', 'add', 'remove', 'migrate') and pump_pool(event):
+            quote = event.get('quoteMint')
+            if (event['action'] in ('buy', 'sell', 'add', 'remove', 'migrate')
+                    and pump_pool(event) and quote in (WSOL, USDC)):
                 price = event['price']
+                # Keep every price in the entry quote, as the live sniper does.
+                if quote != pos['quote_mint']:
+                    price = price / self.sol_price if quote == USDC else price * self.sol_price
                 pos.update(cur_price=price, last_pool_fee=event['poolFeeRate'])
                 if pos['state'] == 'held':
                     change = (price - pos['entry_price']) / pos['entry_price'] * 100
