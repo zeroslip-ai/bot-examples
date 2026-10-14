@@ -13,7 +13,7 @@ Only Pump.fun and Pump-created PumpSwap pools are copied (Mayhem mode skipped).
 LIVE = False (default) only logs paper trades; nothing is sent.
 LIVE = True sends orders with your key to the ZeroSlip Trade API, which signs them.
 
-Run: python3 copytrader_bot.py   (Python 3.11+, pip install aiohttp websockets)
+Run: python3 copytrader_bot.py   (Python 3.9+, pip install aiohttp websockets)
 """
 
 # ---------------------------------- SETTINGS ----------------------------------
@@ -31,8 +31,9 @@ SELL_SLIPPAGE = 99  # %
 PRIORITY_FEE = 0.0001  # SOL
 # ------------------------------------------------------------------------------
 
+# Lets `uv run <file>` install the packages for you. Plain python3 ignores it.
 # /// script
-# requires-python = ">=3.11"
+# requires-python = ">=3.9"
 # dependencies = ["aiohttp>=3.12,<4", "websockets>=15,<16"]
 # ///
 
@@ -71,13 +72,8 @@ def positive(value):
 
 
 def check_address(value, name):
-    # Base58 that decodes to 32 bytes, so a typo fails before the bot starts.
+    # Solana addresses are 32 to 44 base58 characters. Catches pasted text that isn't an address.
     if not isinstance(value, str) or not 32 <= len(value) <= 44 or any(c not in BASE58 for c in value):
-        raise StopBot(f'{name} must be a Solana address')
-    number = 0
-    for char in value:
-        number = number * 58 + BASE58.index(char)
-    if (number.bit_length() + 7) // 8 + len(value) - len(value.lstrip('1')) != 32:
         raise StopBot(f'{name} must be a Solana address')
 
 
@@ -209,7 +205,8 @@ class Trader:
         raise StopBot(f'{signature} not seen on the stream; not retried. Check the wallet before restarting')
 
     def paper_order(self, action, mint, quote, amount, price, tokens):
-        logging.info('PAPER %s mint=%s amount=%s quote=%s', action.upper(), mint, amount, quote)
+        quote_name = 'SOL' if quote == WSOL else 'USDC'
+        logging.info('PAPER %s mint=%s amount=%s quote=%s', action.upper(), mint, amount, quote_name)
         if action == 'buy':
             quantity = amount / price
             self.paper[mint] = {'tokens': quantity, 'cost': amount, 'sol_price': sol_price}
@@ -224,7 +221,7 @@ class Trader:
             self.pnl_sol += pnl if quote == WSOL else pnl / position['sol_price']
             self.sells += 1
             move = (quantity * price / cost - 1) * 100
-            logging.info('PAPER RESULT mint=%s move=%+.2f%% pnl=%+.8f %s', mint, move, pnl, quote)
+            logging.info('PAPER RESULT mint=%s move=%+.2f%% pnl=%+.8f %s', mint, move, pnl, quote_name)
             position['tokens'] -= quantity
             position['cost'] -= cost
             if position['tokens'] <= 0:

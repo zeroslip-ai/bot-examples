@@ -22,7 +22,9 @@ python3 -m pip install aiohttp websockets zstandard orjson
 python3 live_sniper_bot.py
 ```
 
-Python 3.11+. If your system Python blocks `pip install`, use [uv](https://docs.astral.sh/uv/) instead: `uv run live_sniper_bot.py` installs what the file needs.
+Python 3.9 or newer, so the `python3` that comes with macOS works. If your system Python blocks `pip install`, use [uv](https://docs.astral.sh/uv/) instead: `uv run live_sniper_bot.py` installs what the file needs.
+
+The copytrader needs at least one wallet in `WALLETS`, and the sell-all preview needs a `WALLET` address. The other two run as downloaded.
 
 Every bot starts in paper mode (`LIVE = False`). It logs what it would buy and sell, and sends nothing.
 
@@ -32,7 +34,7 @@ Run one streaming bot at a time. The data stream allows one connection per IP ad
 
 - **Market data:** the sniper and copytrader open one websocket to the free [ZeroSlip data stream](https://docs.zeroslip.ai/stream). Trades arrive as JSON, and the bot filters them on your side.
 - **Orders:** with `LIVE = True`, the bot posts each order with your `API_KEY` or `PRIVATE_KEY` to the [ZeroSlip Trade API](https://docs.zeroslip.ai/trade-api), which signs and sends it. The bot then waits up to 3 seconds to see its own trade on the stream.
-- **Backtest:** downloads hourly archives from the ZeroSlip replay service and runs them through the same entry and exit rules.
+- **Backtest:** downloads hourly archives from the replay service (`replay.pumpapi.io`) and runs them through the same entry and exit rules.
 - **Sell all:** paper mode reads balances from public Solana RPC. Live mode asks the Trade API for the balances of your key's wallet (a small fee applies).
 
 Nothing else is contacted. The URLs are constants near the top of each file.

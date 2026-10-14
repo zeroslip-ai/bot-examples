@@ -12,11 +12,11 @@ How it works:
 4. Reports PnL after modeled fees, win rate, exit reasons, and missed entries.
 Fills use the last known price, so results are an estimate, not a promise.
 
-Run: python3 backtest_sniper_strategy.py   (Python 3.11+, pip install aiohttp zstandard orjson)
+Run: python3 backtest_sniper_strategy.py   (Python 3.9+, pip install aiohttp zstandard orjson)
 """
 
 # ---------------------------------- SETTINGS ----------------------------------
-HOURS = 1  # Completed UTC hours to replay. Each hour can be hundreds of MB.
+HOURS = 1  # Completed UTC hours to replay. Each hour is a ~600 MB download (about 2 minutes).
 REPLAY_FILE = ''  # Or a downloaded .jsonl / .jsonl.zst archive to replay instead.
 ALLOW_GAPS = False  # True skips hours missing from the archive instead of stopping.
 
@@ -33,8 +33,9 @@ SERVICE_FEE = 0.0025  # ZeroSlip fee per trade, as a fraction (0.25%).
 EXTRA_FEE = 0.0005  # Extra cost per trade you want to assume, as a fraction.
 # ------------------------------------------------------------------------------
 
+# Lets `uv run <file>` install the packages for you. Plain python3 ignores it.
 # /// script
-# requires-python = ">=3.11"
+# requires-python = ">=3.9"
 # dependencies = ["aiohttp>=3.12,<4", "zstandard>=0.23,<1", "orjson>=3.10,<4"]
 # ///
 
@@ -109,6 +110,8 @@ class Backtest:
         if fill > decision / (1 - min(BUY_SLIPPAGE, 99.9) / 100):
             self.missed += 1
             del self.positions[mint]
+            move = (fill / decision - 1) * 100
+            logging.info('MISS %s: price rose %+.1f%% in %s ms, past BUY_SLIPPAGE', mint, move, BUY_LATENCY_MS)
             return
         amount = pos['amount']
         pos.update(
@@ -122,6 +125,7 @@ class Backtest:
             last_ts=pos['buy_fill_ts'],
         )
         self.buys += 1
+        logging.info('BUY  %s: entry slippage %+.1f%%', mint, pos['buy_slip'])
 
     def trigger_sell(self, pos, ts, reason):
         pos.update(state='pending_sell', sell_reason=reason, sell_fill_ts=ts + SELL_LATENCY_MS)
@@ -146,6 +150,8 @@ class Backtest:
             }
         )
         del self.positions[mint]
+        trade = self.trades[-1]
+        logging.info('SELL %s: %s, move %+.1f%%, pnl %+.8f SOL', mint, reason, trade['pct'], trade['pnl_sol'])
 
     def resolve(self, ts):
         """Fill buys and sells whose latency has passed, and start idle sells."""
@@ -268,7 +274,7 @@ class Backtest:
         pnl_usdc = sum(t['pnl'] for t in trades if t['quote_mint'] == USDC)
         logging.info('PnL=%+.8f SOL (WSOL %+.8f, USDC %+.8f); wins=%s/%s', pnl_sol, pnl_wsol, pnl_usdc, wins, count)
         roi = pnl_sol / volume * 100 if volume else 0
-        logging.info('Volume=%s SOL; ROI=%+.2f%%; fees=%s SOL', volume, roi, sum(t['fee_sol'] for t in trades))
+        logging.info('Volume=%.6f SOL; ROI=%+.2f%%; fees=%.8f SOL', volume, roi, sum(t['fee_sol'] for t in trades))
         if count:
             reasons = Counter(t['reason'] for t in trades)
             exits = reasons['tp'], reasons['sl'], reasons['idle'], reasons['end'], wins / count * 100
@@ -281,7 +287,7 @@ class Backtest:
                 details = t['mint'], t['pnl_sol'], t['pct'], t['reason']
                 logging.info('%s trade: %s pnl=%+.8f SOL move=%+.2f%% exit=%s', label, *details)
         else:
-            logging.info('No trades filled. Check the missed entries and your entry and slippage settings.')
+            logging.info('No trades filled. For more trades, raise HOURS, lower MIN_INITIAL_BUY, or raise BUY_SLIPPAGE.')
         if self.first_ts is not None:
             start = datetime.fromtimestamp(self.first_ts / 1000, timezone.utc)
             end = datetime.fromtimestamp(self.end_ts / 1000, timezone.utc)

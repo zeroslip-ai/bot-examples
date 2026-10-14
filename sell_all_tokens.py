@@ -9,7 +9,7 @@ How it works:
    then sells 100% of each selected token and waits for confirmation.
 Frozen balances are skipped.
 
-Run: python3 sell_all_tokens.py   (Python 3.11+, pip install aiohttp)
+Run: python3 sell_all_tokens.py   (Python 3.9+, pip install aiohttp)
 """
 
 # ---------------------------------- SETTINGS ----------------------------------
@@ -24,8 +24,9 @@ SLIPPAGE = 100  # %. 100 accepts any price.
 PRIORITY_FEE = 0.0001  # SOL
 # ------------------------------------------------------------------------------
 
+# Lets `uv run <file>` install the packages for you. Plain python3 ignores it.
 # /// script
-# requires-python = ">=3.11"
+# requires-python = ">=3.9"
 # dependencies = ["aiohttp>=3.12,<4"]
 # ///
 
@@ -57,13 +58,8 @@ def positive(value):
 
 
 def check_address(value, name):
-    # Base58 that decodes to 32 bytes, so a typo fails before anything runs.
+    # Solana addresses are 32 to 44 base58 characters. Catches pasted text that isn't an address.
     if not isinstance(value, str) or not 32 <= len(value) <= 44 or any(c not in BASE58 for c in value):
-        raise StopBot(f'{name} must be a Solana address')
-    number = 0
-    for char in value:
-        number = number * 58 + BASE58.index(char)
-    if (number.bit_length() + 7) // 8 + len(value) - len(value.lstrip('1')) != 32:
         raise StopBot(f'{name} must be a Solana address')
 
 
